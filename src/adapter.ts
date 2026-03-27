@@ -1,4 +1,5 @@
 import { cp, mkdir, readdir as fsReaddir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import type { NextAdapter } from "next";
@@ -674,6 +675,82 @@ function getInlinedClientReferenceContext(manifestPath) {
         }));
       }
 
+      // Replace the stub cache handler with the real KV implementation at bundle time.
+      build.onLoad({ filter: /cloudflare-cache-handler/ }, () => ({
+        contents: `
+const { env } = require("cloudflare:workers");
+
+class CloudflareKVCacheHandler {
+  constructor(options) {
+    this.debug = options?.debug || false;
+  }
+
+  async get(key) {
+    try {
+      const kv = env.NEXT_CACHE;
+      if (!kv) return null;
+      const raw = await kv.get(key, "text");
+      if (!raw) return null;
+      const entry = JSON.parse(raw);
+      return { value: entry.value, lastModified: entry.lastModified };
+    } catch(e) {
+      if (this.debug) console.error("[cf-cache] get error:", key, e);
+      return null;
+    }
+  }
+
+  async set(key, data, ctx) {
+    try {
+      const kv = env.NEXT_CACHE;
+      if (!kv) return;
+      const entry = {
+        value: data,
+        lastModified: Date.now(),
+        tags: ctx?.tags || [],
+      };
+      const ttl = typeof ctx?.revalidate === "number" ? ctx.revalidate : 31536000;
+      // KV minimum TTL is 60 seconds
+      const expirationTtl = Math.max(ttl, 60);
+      await kv.put(key, JSON.stringify(entry), { expirationTtl });
+      // Store tag->key mappings for revalidateTag
+      for (const tag of entry.tags) {
+        const tagKey = "tag:" + tag;
+        const existing = await kv.get(tagKey, "json") || [];
+        existing.push(key);
+        await kv.put(tagKey, JSON.stringify(existing));
+      }
+    } catch(e) {
+      if (this.debug) console.error("[cf-cache] set error:", key, e);
+    }
+  }
+
+  async revalidateTag(tags) {
+    try {
+      const kv = env.NEXT_CACHE;
+      if (!kv) return;
+      const tagList = Array.isArray(tags) ? tags : [tags];
+      for (const tag of tagList) {
+        const tagKey = "tag:" + tag;
+        const keys = await kv.get(tagKey, "json") || [];
+        await Promise.all(keys.map(k => kv.delete(k)));
+        await kv.delete(tagKey);
+      }
+    } catch(e) {
+      if (this.debug) console.error("[cf-cache] revalidateTag error:", tags, e);
+    }
+  }
+
+  resetRequestCache() {
+    // No-op for KV (no per-request in-memory cache)
+  }
+}
+
+module.exports = CloudflareKVCacheHandler;
+module.exports.default = CloudflareKVCacheHandler;
+`,
+        loader: "js" as const,
+      }));
+
       // Non-JS files that esbuild tries to load as JS
       build.onLoad(
         { filter: /\/(LICENSE|LICENCE|NOTICE|CHANGELOG|README|\.md$|\.txt$)/ },
@@ -1108,6 +1185,8 @@ module.exports = { boot };
       "react-server-dom-turbopack/*",
       // Workers handles node: builtins natively via nodejs_compat
       "node:*",
+      // Cloudflare Workers runtime modules
+      "cloudflare:*",
       // Also without the node: prefix (some compiled deps use bare names)
       "child_process",
       "cluster",
@@ -1500,6 +1579,9 @@ async function writeWranglerConfig(
     { "type": "Text", "globs": ["**/*.html"], "fallthrough": true },
     { "type": "Data", "globs": ["**/*.json"], "fallthrough": true }
   ],
+  "kv_namespaces": [
+    { "binding": "NEXT_CACHE" }
+  ],
   "images": {
     "binding": "IMAGES"
   },
@@ -1526,6 +1608,9 @@ export function createCloudflareAdapter(
     name: ADAPTER_NAME,
 
     modifyConfig(config) {
+      // TODO: Enable KV cache handler for ISR
+      // The cache handler is bundled via esbuild plugin but needs testing
+      // to ensure cloudflare:workers import works inside the bundled server.
       return config;
     },
 
