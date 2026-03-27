@@ -26,11 +26,23 @@ Live demo: https://nextjs-app.southpolesteve.workers.dev
 
 ## What Doesn't Work / Known Gaps
 
-- **Server Actions** - Untested.
-- **API routes** - `/api/og` (OG image generation) likely broken (`@vercel/og` excluded from build).
-- **Cold start** - 22MB minified bootstrap needs to initialize per isolate. Likely several seconds on first request.
-- **404 page** - Returns 500 instead of a styled 404.
-- **Middleware** - Untested (playground doesn't use it).
+### Blockers for production use
+
+- **Cold start time** - The 22MB minified bootstrap needs to initialize on every cold start, likely 3-5 seconds per colo. This is the biggest gap vs vinext, which avoids booting the full Next.js server. Mitigations: [Smart Placement](https://developers.cloudflare.com/workers/configuration/placement/) to pin to fewer colos, or architecturally splitting the server.
+- **Brittle minified code patches** - The adapter matches specific minified variable names (e.g. `i2`, `r3`, `rW`, `uc`) in Next.js compiled output for string replacements. Any Next.js patch release that changes minification output can silently break the adapter. Needs either more robust structural matching or upstream Next.js changes.
+- **10MB compressed size limit** - The Worker is at ~9.8MB compressed with zero headroom. One more dependency or Next.js version bump and deploys will fail. Needs bundle audit, aggressive tree-shaking, or splitting into multiple workers via service bindings.
+- **No automated tests** - Zero tests. Any change can silently break things.
+
+### Untested features
+
+- **Server Actions** - POST requests, form submissions, revalidation on mutation. Untested and likely needs fixes.
+- **Middleware** - Untested (playground doesn't use it). Many production apps use middleware for auth, redirects, A/B testing.
+- **`use cache` directives** - `use cache: remote` and `use cache: private` need the `cacheHandlers` config (plural), which is a different interface from the `cacheHandler` (singular) used for ISR. Not implemented.
+
+### Known broken
+
+- **API routes** - `/api/og` (OG image generation) broken (`@vercel/og` excluded from build).
+- **404 page** - Returns 500 instead of a styled 404. The `pages/404.html` and `pages/500.html` static files aren't included in the output.
 
 ## How It Works
 
