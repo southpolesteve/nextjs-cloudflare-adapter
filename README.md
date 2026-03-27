@@ -16,7 +16,7 @@ Live demo: https://nextjs-app.southpolesteve.workers.dev
 - **Client-side navigation** - RSC flight transitions between pages (no full page reloads)
 - **React hydration and interactivity** - Event handlers, state, client components all work
 - **Nested layouts** - Layout state preserved across navigation
-- **Images** - `public/` directory files served from CDN (with `unoptimized: true`)
+- **Image optimization** - `/_next/image` requests are handled by the [Cloudflare Images binding](https://developers.cloudflare.com/images/transform-images/bindings/), serving optimized WebP/AVIF at the requested size and quality. No `sharp` needed.
 - **View transitions** - Working
 - **Error boundaries** - Working
 - **Route groups, parallel routes** - Working
@@ -25,7 +25,6 @@ Live demo: https://nextjs-app.southpolesteve.workers.dev
 
 ## What Doesn't Work / Known Gaps
 
-- **Image optimization** - `/_next/image` returns 500 because `sharp` can't run in Workers. Currently using `images.unoptimized: true`. Should use the [Cloudflare Images binding](https://developers.cloudflare.com/images/transform-images/bindings/) or the built-in Next.js `images.loader` hook.
 - **ISR / revalidation** - No cache handler backend. Pages with `revalidate` serve the build-time version forever. Needs KV or R2.
 - **`use cache` directives** - No cache handler implementation for `remote` or `private` cache.
 - **Server Actions** - Untested.
