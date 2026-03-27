@@ -8,6 +8,22 @@ A Next.js deployment adapter for Cloudflare Workers, built on the [Next.js adapt
 
 Live demo: https://nextjs-app.southpolesteve.workers.dev
 
+## Why vinext Still Matters
+
+This adapter is useful as a compatibility experiment and as feedback for the Next.js adapter API, but it does not change the long-term direction: [vinext](https://github.com/nicholascelestin/vinext) is still the place with the bigger upside, and it will continue to see investment.
+
+Even if the adapter API eventually fixed every runtime gap listed below, an adapter-based deployment still inherits fundamental costs from the stock Next.js server model: large server bundles, Node.js compatibility layers, heavier startup work, and build output that was not designed specifically for Workers. Those constraints put a ceiling on production performance, cold starts, build speed, and final bundle size.
+
+vinext has a much higher ceiling because it is free to target Workers directly instead of adapting the Node-oriented Next.js server after the fact. That gives it room to pursue optimizations that this approach cannot fully unlock, including:
+
+- smaller worker bundles
+- faster cold starts
+- less runtime indirection and compatibility shimming
+- better build performance
+- more control over how routes, assets, and server logic are split for the edge
+
+In other words: improving the adapter API would make this project less brittle and easier to maintain, which is valuable. But it would not erase the architectural advantage of a Workers-native approach, and that is why vinext remains the more important long-term investment.
+
 ## What Works
 
 - **Static/prerendered pages** - Served from Cloudflare's CDN edge via Workers Static Assets
