@@ -1388,6 +1388,54 @@ export default {
       }
     }
 
+    // Handle /_next/image requests using Cloudflare Images binding
+    if (url.pathname === "/_next/image" && env.IMAGES) {
+      try {
+        const imageUrl = url.searchParams.get("url");
+        const width = parseInt(url.searchParams.get("w") || "0", 10);
+        const quality = parseInt(url.searchParams.get("q") || "75", 10);
+
+        if (imageUrl) {
+          // Fetch the source image from assets
+          const sourceUrl = new URL(imageUrl, request.url);
+          const sourceResponse = await env.ASSETS.fetch(
+            new Request(sourceUrl.toString())
+          );
+
+          if (sourceResponse.ok && sourceResponse.body) {
+            // Determine output format from Accept header
+            const accept = request.headers.get("Accept") || "";
+            let format = "image/webp";
+            if (accept.includes("image/avif")) format = "image/avif";
+            else if (accept.includes("image/webp")) format = "image/webp";
+            else if (accept.includes("image/jpeg") || imageUrl.endsWith(".jpg") || imageUrl.endsWith(".jpeg")) format = "image/jpeg";
+            else if (imageUrl.endsWith(".png")) format = "image/png";
+
+            const transforms = {};
+            if (width > 0) transforms.width = width;
+
+            const output = await env.IMAGES
+              .input(sourceResponse.body)
+              .transform(transforms)
+              .output({ format, quality });
+
+            const resp = output.response();
+            return new Response(resp.body, {
+              status: 200,
+              headers: {
+                "content-type": format,
+                "cache-control": "public, max-age=31536000, immutable",
+                "vary": "Accept",
+              },
+            });
+          }
+        }
+      } catch (err) {
+        console.error("[nextjs-cloudflare] Image transform error:", err);
+        // Fall through to Next.js server
+      }
+    }
+
     try {
       await bootNextServer(env);
     } catch (err) {
@@ -1452,6 +1500,9 @@ async function writeWranglerConfig(
     { "type": "Text", "globs": ["**/*.html"], "fallthrough": true },
     { "type": "Data", "globs": ["**/*.json"], "fallthrough": true }
   ],
+  "images": {
+    "binding": "IMAGES"
+  },
   "assets": {
     "binding": "ASSETS",
     "directory": "./assets"
@@ -1475,16 +1526,7 @@ export function createCloudflareAdapter(
     name: ADAPTER_NAME,
 
     modifyConfig(config) {
-      return {
-        ...config,
-        images: {
-          ...config.images,
-          // Workers can't run sharp for image optimization.
-          // Use unoptimized images (served directly from assets).
-          // TODO: Use Cloudflare Image Resizing instead.
-          unoptimized: true,
-        },
-      };
+      return config;
     },
 
     async onBuildComplete(ctx) {
