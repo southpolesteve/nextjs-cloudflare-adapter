@@ -22,11 +22,10 @@ Live demo: https://nextjs-app.southpolesteve.workers.dev
 - **Route groups, parallel routes** - Working
 - **CSS/JS assets** - Served from CDN edge
 - **Code syntax highlighting** - Working (CodeHike)
+- **ISR / Incremental Static Regeneration** - KV-backed cache handler with automatic namespace provisioning. Pages with `revalidate` are cached in [Workers KV](https://developers.cloudflare.com/kv/) and revalidated on schedule. Tag-based revalidation (`revalidateTag`) is supported. Enable debug logging with `NEXT_CACHE_DEBUG=true`.
 
 ## What Doesn't Work / Known Gaps
 
-- **ISR / revalidation** - No cache handler backend. Pages with `revalidate` serve the build-time version forever. Needs KV or R2.
-- **`use cache` directives** - No cache handler implementation for `remote` or `private` cache.
 - **Server Actions** - Untested.
 - **API routes** - `/api/og` (OG image generation) likely broken (`@vercel/og` excluded from build).
 - **Cold start** - 22MB minified bootstrap needs to initialize per isolate. Likely several seconds on first request.
@@ -35,13 +34,15 @@ Live demo: https://nextjs-app.southpolesteve.workers.dev
 
 ## How It Works
 
-1. `next build` runs the adapter's `onBuildComplete` hook
+1. `next build` runs the adapter's `modifyConfig` (sets up KV cache handler) and `onBuildComplete` hooks
 2. Static assets (CSS, JS, images, prerendered HTML) are staged for Workers Static Assets
 3. The Next.js server is bundled with esbuild into a single `server-bootstrap.mjs` file (~22MB minified)
 4. Turbopack runtimes and external modules are bundled separately with esbuild
 5. A thin `worker.mjs` entry point uses `httpServerHandler` from `cloudflare:node` to bridge Worker `fetch()` to the Node.js HTTP server
-6. Manifests are inlined at build time to avoid `fs.readFileSync` calls at runtime
-7. `wrangler deploy` uploads everything
+6. `/_next/image` requests are intercepted and handled by the Cloudflare Images binding
+7. Manifests are inlined at build time to avoid `fs.readFileSync` calls at runtime
+8. A KV-backed cache handler is deployed as a standalone CJS module for ISR
+9. `wrangler deploy` uploads everything and auto-provisions the KV namespace
 
 ## Usage
 
