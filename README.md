@@ -121,17 +121,19 @@ The Node.js HTTP server's `ServerResponse` has methods (`flushHeaders`, `writeEa
 
 ## Performance Comparison
 
-Warm TTFB from a single location (not a rigorous benchmark):
+Median warm TTFB (3 runs, all caches warm, from a single location, not a rigorous benchmark):
 
 | Route | This Adapter | [vinext](https://github.com/nicholascelestin/vinext) | Vercel |
 |---|---|---|---|
-| `/` (homepage) | 123ms | 437ms | 256ms |
-| `/layouts` | 163ms | 147ms | 355ms |
-| `/loading/clothing` (dynamic SSR) | 185ms | 139ms | 336ms |
-| `/context` | 180ms | 146ms | 392ms |
-| `/view-transitions` | 139ms | 168ms | 484ms |
+| `/` (homepage) | 157ms | 156ms | 184ms |
+| `/layouts` | 179ms | 150ms | 185ms |
+| `/loading/clothing` (dynamic SSR) | 180ms | 193ms | 283ms |
+| `/context` | 154ms | 181ms | 224ms |
+| `/view-transitions` | 166ms | 149ms | 205ms |
 
-This adapter and vinext are competitive on TTFB, both consistently faster than Vercel (which runs in us-east-1 while Workers run at edge). Cold starts will be significantly worse for this adapter due to the 22MB bootstrap.
+When warm, all three Workers-based deployments (this adapter and vinext) are in the same ballpark (~150-190ms). Vercel is consistently slower (~185-280ms) because it serves from us-east-1 while Workers run at the nearest edge colo.
+
+The real performance difference is cold starts. This adapter boots the entire Next.js server (~22MB) on first request per isolate, which adds several seconds. vinext avoids this by not running the full Next.js server at all.
 
 ## License
 
