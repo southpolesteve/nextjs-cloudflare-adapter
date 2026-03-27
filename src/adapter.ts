@@ -391,6 +391,8 @@ async function getCleanedNextConfig(
         delete config.turbopack.root;
       }
       config.distDir = ".next";
+      // Disable cache handler for now - needs further debugging
+      delete config.cacheHandler;
       return JSON.stringify(config);
     }
   } catch {
@@ -674,82 +676,6 @@ function getInlinedClientReferenceContext(manifestPath) {
           loader: "js" as const,
         }));
       }
-
-      // Replace the stub cache handler with the real KV implementation at bundle time.
-      build.onLoad({ filter: /cloudflare-cache-handler/ }, () => ({
-        contents: `
-const { env } = require("cloudflare:workers");
-
-class CloudflareKVCacheHandler {
-  constructor(options) {
-    this.debug = options?.debug || false;
-  }
-
-  async get(key) {
-    try {
-      const kv = env.NEXT_CACHE;
-      if (!kv) return null;
-      const raw = await kv.get(key, "text");
-      if (!raw) return null;
-      const entry = JSON.parse(raw);
-      return { value: entry.value, lastModified: entry.lastModified };
-    } catch(e) {
-      if (this.debug) console.error("[cf-cache] get error:", key, e);
-      return null;
-    }
-  }
-
-  async set(key, data, ctx) {
-    try {
-      const kv = env.NEXT_CACHE;
-      if (!kv) return;
-      const entry = {
-        value: data,
-        lastModified: Date.now(),
-        tags: ctx?.tags || [],
-      };
-      const ttl = typeof ctx?.revalidate === "number" ? ctx.revalidate : 31536000;
-      // KV minimum TTL is 60 seconds
-      const expirationTtl = Math.max(ttl, 60);
-      await kv.put(key, JSON.stringify(entry), { expirationTtl });
-      // Store tag->key mappings for revalidateTag
-      for (const tag of entry.tags) {
-        const tagKey = "tag:" + tag;
-        const existing = await kv.get(tagKey, "json") || [];
-        existing.push(key);
-        await kv.put(tagKey, JSON.stringify(existing));
-      }
-    } catch(e) {
-      if (this.debug) console.error("[cf-cache] set error:", key, e);
-    }
-  }
-
-  async revalidateTag(tags) {
-    try {
-      const kv = env.NEXT_CACHE;
-      if (!kv) return;
-      const tagList = Array.isArray(tags) ? tags : [tags];
-      for (const tag of tagList) {
-        const tagKey = "tag:" + tag;
-        const keys = await kv.get(tagKey, "json") || [];
-        await Promise.all(keys.map(k => kv.delete(k)));
-        await kv.delete(tagKey);
-      }
-    } catch(e) {
-      if (this.debug) console.error("[cf-cache] revalidateTag error:", tags, e);
-    }
-  }
-
-  resetRequestCache() {
-    // No-op for KV (no per-request in-memory cache)
-  }
-}
-
-module.exports = CloudflareKVCacheHandler;
-module.exports.default = CloudflareKVCacheHandler;
-`,
-        loader: "js" as const,
-      }));
 
       // Non-JS files that esbuild tries to load as JS
       build.onLoad(
@@ -1393,6 +1319,63 @@ globalThis.__cf_lstat = __cf_lstat;
 }
 
 /**
+ * Write the KV cache handler as a standalone CJS module.
+ * Uploaded via wrangler rules and loaded by Next.js at runtime.
+ */
+async function writeCacheHandler(outDir: string): Promise<void> {
+  const handlerCode = `"use strict";
+function getKV() {
+  var e = globalThis.__cfEnv;
+  return e && e.NEXT_CACHE;
+}
+class CloudflareKVCacheHandler {
+  constructor(options) { this.debug = options && options.debug || false; }
+  async get(key) {
+    try {
+      var kv = getKV(); if (!kv) return null;
+      var raw = await kv.get(key, "text"); if (!raw) return null;
+      var entry = JSON.parse(raw);
+      return { value: entry.value, lastModified: entry.lastModified };
+    } catch(e) { if (this.debug) console.error("[cf-cache] get error:", key, e); return null; }
+  }
+  async set(key, data, ctx) {
+    try {
+      var kv = getKV(); if (!kv) return;
+      var entry = { value: data, lastModified: Date.now(), tags: ctx && ctx.tags || [] };
+      var ttl = typeof (ctx && ctx.revalidate) === "number" ? ctx.revalidate : 31536000;
+      await kv.put(key, JSON.stringify(entry), { expirationTtl: Math.max(ttl, 60) });
+      for (var i = 0; i < entry.tags.length; i++) {
+        var tagKey = "tag:" + entry.tags[i];
+        var existing = await kv.get(tagKey, "json") || [];
+        existing.push(key);
+        await kv.put(tagKey, JSON.stringify(existing));
+      }
+    } catch(e) { if (this.debug) console.error("[cf-cache] set error:", key, e); }
+  }
+  async revalidateTag(tags) {
+    try {
+      var kv = getKV(); if (!kv) return;
+      var tagList = Array.isArray(tags) ? tags : [tags];
+      for (var i = 0; i < tagList.length; i++) {
+        var tagKey = "tag:" + tagList[i];
+        var keys = await kv.get(tagKey, "json") || [];
+        await Promise.all(keys.map(function(k) { return kv.delete(k); }));
+        await kv.delete(tagKey);
+      }
+    } catch(e) { if (this.debug) console.error("[cf-cache] revalidateTag error:", tags, e); }
+  }
+  resetRequestCache() {}
+}
+module.exports = CloudflareKVCacheHandler;
+module.exports.default = CloudflareKVCacheHandler;
+`;
+  // Write to .next/ so the wrangler ".next/**/*.js" CommonJS rule picks it up
+  const destPath = path.join(outDir, ".next", "cloudflare-cache-handler.js");
+  await mkdir(path.dirname(destPath), { recursive: true });
+  await writeFile(destPath, handlerCode);
+}
+
+/**
  * Write the thin worker entry point that imports the bundled bootstrap.
  */
 async function writeWorkerEntry(outDir: string): Promise<void> {
@@ -1422,6 +1405,9 @@ async function bootNextServer(env) {
       }
       process.env.PORT = String(NEXT_SERVER_PORT);
       process.env.HOSTNAME = "127.0.0.1";
+
+      // Expose env to the cache handler (which runs inside the bundled server)
+      globalThis.__cfEnv = env;
 
       const server = await boot();
       nodeServerHandler = httpServerHandler(server);
@@ -1608,9 +1594,6 @@ export function createCloudflareAdapter(
     name: ADAPTER_NAME,
 
     modifyConfig(config) {
-      // TODO: Enable KV cache handler for ISR
-      // The cache handler is bundled via esbuild plugin but needs testing
-      // to ensure cloudflare:workers import works inside the bundled server.
       return config;
     },
 
@@ -1633,6 +1616,13 @@ export function createCloudflareAdapter(
 
       console.log(`[${ADAPTER_NAME}] Bundling server bootstrap...`);
       await bundleServerBootstrap(ctx, outDir);
+
+      // Write the cache handler as a standalone CJS module in the output.
+      // It gets uploaded via wrangler rules as CommonJS and loaded by
+      // Next.js at runtime via require(config.cacheHandler).
+      // Uses globalThis.__cfEnv (set by worker entry) for KV access.
+      console.log(`[${ADAPTER_NAME}] Writing cache handler...`);
+      await writeCacheHandler(outDir);
 
       console.log(`[${ADAPTER_NAME}] Writing worker entry...`);
       await writeWorkerEntry(outDir);
