@@ -19,6 +19,11 @@ interface CloudflareAdapterOptions {
   skipWranglerConfig?: boolean;
 }
 
+const BUILD_TIME_CACHE_HANDLER_STUB = ".next-cloudflare-cache-handler.cjs";
+const RUNTIME_CACHE_HANDLER = "cloudflare-cache-handler.js";
+const TURBO_RUNTIME_CACHE_HANDLER_SPECIFIER = "../../../../../../../cloudflare-cache-handler.js";
+const TURBO_RUNTIME_INSTRUMENTATION_SPECIFIER = "../../../../../../instrumentation.js";
+
 function resolveOutDir(projectDir: string, configuredOutDir: string): string {
   if (path.isAbsolute(configuredOutDir)) return configuredOutDir;
   return path.join(projectDir, configuredOutDir);
@@ -220,6 +225,27 @@ async function bundleTurboRuntimes(
       .replace(/__require\d*\(/g, "require(")
       .replace(/__require\d*\./g, "require.")
       .replace(
+        "return (0, i2.pathToFileURL)(r3).toString();",
+        [
+          `if (r3.endsWith("/.next/${RUNTIME_CACHE_HANDLER}") || r3.endsWith(a2().sep + ".next" + a2().sep + "${RUNTIME_CACHE_HANDLER}")) {`,
+          `  return "${TURBO_RUNTIME_CACHE_HANDLER_SPECIFIER}";`,
+          "}",
+          "return (0, i2.pathToFileURL)(r3).toString();",
+        ].join("\n")
+      )
+      .replace(
+        'await require(_nodepath.default.join(projectDir, distDir, "server", `${_constants.INSTRUMENTATION_HOOK_FILENAME}.js`))',
+        `await require("${TURBO_RUNTIME_INSTRUMENTATION_SPECIFIER}")`
+      )
+      .replace(
+        "i10 = rW(await uc(e11(this.distDir, s10)));",
+        `i10 = rW(require("${TURBO_RUNTIME_CACHE_HANDLER_SPECIFIER}"));`
+      )
+      .replace(
+        "(0, tw.XJ)(t11, rW(await uc(n11(`${s10}/${this.distDir}`, r11))));",
+        `(0, tw.XJ)(t11, rW(require("${TURBO_RUNTIME_CACHE_HANDLER_SPECIFIER}")));`
+      )
+      .replace(
         /(\w+)\.once\("close",\s*\(\)\s*=>\s*\{\s*\1\.writableFinished\s*\|\|\s*(\w+)\.abort\(new (\w+)\(\)\);?\s*\}\),\s*\2/g,
         '$1.once("close",()=>{if($1.writableFinished)return;if(!$1.destroyed&&!$1.errored)return;$2.abort(new $3())}),$2'
       )
@@ -391,14 +417,51 @@ async function getCleanedNextConfig(
         delete config.turbopack.root;
       }
       config.distDir = ".next";
-      // Disable cache handler for now - needs further debugging
-      delete config.cacheHandler;
+      config.cacheHandler = RUNTIME_CACHE_HANDLER;
       return JSON.stringify(config);
     }
   } catch {
     // fall through
   }
   return "{}";
+}
+
+function writeBuildTimeCacheHandlerStub(projectDir: string): string {
+  const stubPath = path.join(projectDir, BUILD_TIME_CACHE_HANDLER_STUB);
+  const stubCode = `"use strict";
+class CloudflareBuildTimeCacheHandler {
+  constructor() {
+    this.cache = new Map();
+  }
+  async get(key) {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    return { value: entry.value, lastModified: entry.lastModified };
+  }
+  async set(key, data, ctx) {
+    this.cache.set(key, {
+      value: data,
+      lastModified: Date.now(),
+      tags: (ctx && ctx.tags) || [],
+    });
+  }
+  async revalidateTag(tags) {
+    const tagList = Array.isArray(tags) ? tags : [tags];
+    const tagSet = new Set(tagList);
+    for (const [key, entry] of this.cache.entries()) {
+      if (entry.tags.some((tag) => tagSet.has(tag))) {
+        this.cache.delete(key);
+      }
+    }
+  }
+  resetRequestCache() {}
+}
+module.exports = CloudflareBuildTimeCacheHandler;
+module.exports.default = CloudflareBuildTimeCacheHandler;
+`;
+
+  writeFileSync(stubPath, stubCode);
+  return stubPath;
 }
 
 async function getClientReferenceManifestJson(distDir: string): Promise<string> {
@@ -634,6 +697,33 @@ function getInlinedClientReferenceContext(manifestPath) {
 
           return { contents, loader: "js" as const };
         }
+      );
+
+      // Next 16 loads the cache handler via dynamic import(formatDynamicImportPath(...)).
+      // Wrangler's module registry can resolve the emitted CommonJS module by a
+      // relative specifier like "./.next/cloudflare-cache-handler.js", but not by
+      // an absolute file:// URL into the sandboxed bundle output path.
+      build.onLoad(
+        { filter: /next[\\/]dist[\\/]lib[\\/]format-dynamic-import-path\.js$/ },
+        () => ({
+          contents: [
+            '"use strict";',
+            'Object.defineProperty(exports, "__esModule", { value: true });',
+            'Object.defineProperty(exports, "formatDynamicImportPath", { enumerable: true, get: function() { return formatDynamicImportPath; } });',
+            'const path = require("path");',
+            'const { pathToFileURL } = require("url");',
+            'function toPosixPath(value) { return value.split(path.sep).join("/"); }',
+            'const formatDynamicImportPath = (dir, filePath) => {',
+            '  const resolvedFilePath = path.resolve(path.isAbsolute(filePath) ? filePath : path.join(dir, filePath));',
+            '  const normalizedResolvedFilePath = toPosixPath(resolvedFilePath);',
+            `  if (normalizedResolvedFilePath.endsWith("/.next/${RUNTIME_CACHE_HANDLER}")) {`,
+            `    return "./.next/${RUNTIME_CACHE_HANDLER}";`,
+            '  }',
+            '  return pathToFileURL(resolvedFilePath).toString();',
+            '};',
+          ].join("\n"),
+          loader: "js" as const,
+        })
       );
 
       // Stub unsupported Node.js builtins that Workers doesn't provide
@@ -1021,8 +1111,6 @@ async function boot() {
   process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(nextConfig);
   delete process.env.NEXT_ADAPTER_PATH;
 
-  try { process.chdir(__dirname); } catch(e) {}
-
   // Pre-initialize the manifests singleton on globalThis so the turbo runtime
   // doesn't throw "manifests singleton was not initialized" before the server
   // has a chance to call setManifestsSingleton during rendering.
@@ -1038,7 +1126,7 @@ async function boot() {
 
   const createNext = require("next").default || require("next");
   const app = createNext({
-    dir: __dirname,
+    dir: __projectDir,
     dev: false,
     quiet: true,
     hostname: "127.0.0.1",
@@ -1057,7 +1145,9 @@ async function boot() {
   });
 
   const server = http.createServer((req, res) => {
-    handle(req, res).catch((err) => {
+    Promise.resolve()
+      .then(() => handle(req, res))
+      .catch((err) => {
       console.error("[nextjs-cloudflare] handler error:", err.stack || err);
       if (!res.headersSent) {
         res.writeHead(500, { "content-type": "text/plain" });
@@ -1131,7 +1221,8 @@ module.exports = { boot };
         'import { createRequire as __createRequire } from "node:module";',
         'import { fileURLToPath as __fileURLToPath } from "node:url";',
         'import { dirname as __dirname_fn } from "node:path";',
-        'const __rawRequire = __createRequire("file:///server-bootstrap.mjs");',
+        'const __moduleUrl = import.meta.url === "file:///server-bootstrap.mjs" ? "file:///.cloudflare/server-bootstrap.mjs" : (import.meta.url || "file:///server-bootstrap.mjs");',
+        'const __rawRequire = __createRequire(__moduleUrl);',
         'function __maybeParseJson(id, result) {',
         '  if (id.endsWith(".json") && result != null && typeof result !== "function") {',
         '    try {',
@@ -1143,21 +1234,26 @@ module.exports = { boot };
         '  return result;',
         '}',
         'const require = function(id) {',
-
         '  try { return __maybeParseJson(id, __rawRequire(id)); } catch(e) {',
-        '    var stripped = id.startsWith("/") ? id.slice(1) : id;',
-        '    if (id !== stripped) try { return __maybeParseJson(id, __rawRequire(stripped)); } catch(e2) {}',
+        '    var filePath = id.startsWith("file://") ? __fileURLToPath(id) : id;',
+        '    var stripped = filePath.startsWith("/") ? filePath.slice(1) : filePath;',
+        '    if (filePath !== id) try { return __maybeParseJson(id, __rawRequire(filePath)); } catch(e7) {}',
+        '    if (filePath !== stripped) try { return __maybeParseJson(id, __rawRequire(stripped)); } catch(e2) {}',
         '    if (stripped.startsWith("server/")) try { return __maybeParseJson(id, __rawRequire(".next/" + stripped)); } catch(e3) {}',
         '    if (stripped.includes("chunks/next/")) try { return __maybeParseJson(id, __rawRequire(stripped.replace("chunks/next/", "chunks/ssr/next/"))); } catch(e5) {}',
         '    if (stripped.includes("chunks/next/")) try { return __maybeParseJson(id, __rawRequire(".next/" + stripped.replace("chunks/next/", "chunks/ssr/next/"))); } catch(e6) {}',
-        '    if (id.includes(".next/")) try { return __maybeParseJson(id, __rawRequire(id.replace(/.*(\\.next\\/)/, ".next/"))); } catch(e4) {}',
+        '    if (filePath.includes(".next/")) try { return __maybeParseJson(id, __rawRequire(filePath.replace(/.*(\\.next\\/)/, ".next/"))); } catch(e4) {}',
         '    throw e;',
         '  }',
         '};',
         'require.resolve = __rawRequire.resolve;',
         'require.cache = __rawRequire.cache || {};',
-        'const __filename = __fileURLToPath(import.meta.url || "file:///server-bootstrap.mjs");',
+        'const __filename = __fileURLToPath(__moduleUrl);',
         'const __dirname = __dirname_fn(__filename);',
+        'const __projectDir = __dirname === "/" ? "/.cloudflare" : __dirname;',
+        'if (typeof process === "object" && process && typeof process.cwd === "function" && process.cwd() === "/" && __projectDir !== "/") {',
+        '  process.cwd = function() { return __projectDir; };',
+        '}',
       ].join("\n"),
     },
     // Resolve from the project directory where node_modules lives
@@ -1328,15 +1424,25 @@ function getKV() {
   var e = globalThis.__cfEnv;
   return e && e.NEXT_CACHE;
 }
+function isDebugEnabled(options) {
+  var env = globalThis.__cfEnv;
+  var proc = typeof process === "object" && process ? process.env : undefined;
+  return !!(
+    (options && options.debug) ||
+    (env && (env.NEXT_CACHE_DEBUG === "true" || env.NEXT_PRIVATE_DEBUG_CACHE === "true")) ||
+    (proc && (proc.NEXT_CACHE_DEBUG === "true" || proc.NEXT_PRIVATE_DEBUG_CACHE === "true"))
+  );
+}
 class CloudflareKVCacheHandler {
-  constructor(options) { this.debug = options && options.debug || false; }
+  constructor(options) { this.debug = isDebugEnabled(options); }
   async get(key) {
     try {
-      var kv = getKV(); if (!kv) return null;
-      var raw = await kv.get(key, "text"); if (!raw) return null;
+      var kv = getKV(); if (!kv) { if (this.debug) console.error("[cf-cache] get no-kv:", key); return null; }
+      var raw = await kv.get(key, "text"); if (!raw) { if (this.debug) console.error("[cf-cache] get miss:", key); return null; }
       var entry = JSON.parse(raw);
+      if (this.debug) console.error("[cf-cache] get hit:", key, "kind=", entry && entry.value && entry.value.kind);
       return { value: entry.value, lastModified: entry.lastModified };
-    } catch(e) { if (this.debug) console.error("[cf-cache] get error:", key, e); return null; }
+    } catch(e) { console.error("[cf-cache] get error:", key, e); return null; }
   }
   async set(key, data, ctx) {
     try {
@@ -1344,25 +1450,27 @@ class CloudflareKVCacheHandler {
       var entry = { value: data, lastModified: Date.now(), tags: ctx && ctx.tags || [] };
       var ttl = typeof (ctx && ctx.revalidate) === "number" ? ctx.revalidate : 31536000;
       await kv.put(key, JSON.stringify(entry), { expirationTtl: Math.max(ttl, 60) });
+      if (this.debug) console.error("[cf-cache] set:", key, "kind=", data && data.kind, "ttl=", Math.max(ttl, 60));
       for (var i = 0; i < entry.tags.length; i++) {
         var tagKey = "tag:" + entry.tags[i];
         var existing = await kv.get(tagKey, "json") || [];
         existing.push(key);
         await kv.put(tagKey, JSON.stringify(existing));
       }
-    } catch(e) { if (this.debug) console.error("[cf-cache] set error:", key, e); }
+    } catch(e) { console.error("[cf-cache] set error:", key, e); }
   }
   async revalidateTag(tags) {
     try {
       var kv = getKV(); if (!kv) return;
       var tagList = Array.isArray(tags) ? tags : [tags];
+      if (this.debug) console.error("[cf-cache] revalidateTag:", tagList);
       for (var i = 0; i < tagList.length; i++) {
         var tagKey = "tag:" + tagList[i];
         var keys = await kv.get(tagKey, "json") || [];
         await Promise.all(keys.map(function(k) { return kv.delete(k); }));
         await kv.delete(tagKey);
       }
-    } catch(e) { if (this.debug) console.error("[cf-cache] revalidateTag error:", tags, e); }
+    } catch(e) { console.error("[cf-cache] revalidateTag error:", tags, e); }
   }
   resetRequestCache() {}
 }
@@ -1518,7 +1626,15 @@ export default {
       });
     }
 
-    return nodeServerHandler.fetch(request, env, ctx);
+    try {
+      return await nodeServerHandler.fetch(request, env, ctx);
+    } catch (err) {
+      console.error("[nextjs-cloudflare] nodeServerHandler.fetch error:", err);
+      return new Response("Internal Server Error", {
+        status: 500,
+        headers: { "content-type": "text/plain" },
+      });
+    }
   },
 };
 `;
@@ -1593,8 +1709,22 @@ export function createCloudflareAdapter(
   return {
     name: ADAPTER_NAME,
 
-    modifyConfig(config) {
-      return config;
+    modifyConfig(config, ctx) {
+      if (
+        ctx.phase !== "phase-production-build" &&
+        ctx.phase !== "phase-production-server" &&
+        ctx.phase !== "phase-export"
+      ) {
+        return config;
+      }
+
+      const projectDir = process.cwd();
+      const cacheHandlerStubPath = writeBuildTimeCacheHandlerStub(projectDir);
+
+      return {
+        ...config,
+        cacheHandler: cacheHandlerStubPath,
+      };
     },
 
     async onBuildComplete(ctx) {
