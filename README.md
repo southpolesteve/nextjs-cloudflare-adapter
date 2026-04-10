@@ -47,7 +47,7 @@ In other words: improving the adapter API would make this project less brittle a
 - **Cold start time** - The 22MB minified bootstrap needs to initialize on every cold start, likely 3-5 seconds per colo. This is the biggest gap vs vinext, which avoids booting the full Next.js server. Mitigations: [Smart Placement](https://developers.cloudflare.com/workers/configuration/placement/) to pin to fewer colos, or architecturally splitting the server.
 - **Brittle minified code patches** - The adapter matches specific minified variable names (e.g. `i2`, `r3`, `rW`, `uc`) in Next.js compiled output for string replacements. Any Next.js patch release that changes minification output can silently break the adapter. Needs either more robust structural matching or upstream Next.js changes.
 - **10MB compressed size limit** - The Worker is at ~9.8MB compressed with zero headroom. One more dependency or Next.js version bump and deploys will fail. Needs bundle audit, aggressive tree-shaking, or splitting into multiple workers via service bindings.
-- **No automated tests** - Zero tests. Any change can silently break things.
+- **Automated adapter coverage** - The repo includes a local harness for Next.js's documented deploy/adapters suite, and GitHub Actions runs that suite on every push and pull request against a pinned Next.js checkout.
 
 ### Untested features
 
@@ -92,6 +92,24 @@ cd .cloudflare && npx wrangler dev
 
 # Deploy
 cd .cloudflare && npx wrangler deploy
+```
+
+## Testing
+
+This repo includes the official Next.js deploy/adapters harness that the adapter API is documented around.
+
+```bash
+# Clone a Next.js checkout once
+git clone --depth 1 --branch v16.2.2 https://github.com/vercel/next.js.git ../next.js
+
+# Prepare that checkout (install, build, playwright)
+npm run test:nextjs:local:prepare -- ../next.js
+
+# Run the default shard locally
+npm run test:nextjs:local -- ../next.js
+
+# Run a specific shard from the official deploy/adapters manifest
+NEXT_TEST_GROUP=7/16 npm run test:nextjs:local -- ../next.js
 ```
 
 ## What the Next.js Adapter API Needs to Improve

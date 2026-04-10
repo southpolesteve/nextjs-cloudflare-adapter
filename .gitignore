@@ -1,5 +1,14 @@
 node_modules/
-dist/
-.cloudflare/
 .next/
+.adapter/
+.wrangler/
 *.tgz
+*.results.json
+.adapter-build.log
+.adapter-server.log
+.adapter-node-sidecar.log
+.adapter-server.pid
+.adapter-server.port
+.adapter-node-sidecar.pid
+.adapter-node-sidecar.port
+next.js-src/
