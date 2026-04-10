@@ -96,7 +96,12 @@ cd .cloudflare && npx wrangler deploy
 
 ## Testing
 
-This repo includes the official Next.js deploy/adapters harness that the adapter API is documented around.
+This repo follows the documented Next.js adapter testing flow:
+
+- [Testing adapters](https://nextjs.org/docs/app/api-reference/adapters/testing-adapters)
+- [Adapter path / adapter API](https://nextjs.org/docs/app/api-reference/config/next-config-js/adapterPath)
+
+The local and CI harnesses run against Next.js's deploy/adapters manifest at `test/deploy-tests-manifest.json` in a pinned Next.js checkout. In the `v16.2.2` checkout used here, that manifest expands to `795` suites total, so the GitHub Actions job fans out across `16` shards instead of trying to run everything serially in one job. The `50`-suite run we validated locally is shard `1/16`, not the entire manifest.
 
 ```bash
 # Clone a Next.js checkout once
