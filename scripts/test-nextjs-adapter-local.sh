@@ -69,7 +69,7 @@ export NEXT_TEST_CLEANUP_SCRIPT_PATH="${REPO_DIR}/scripts/e2e-cleanup.sh"
 RUN_ARGS=(--timings --type e2e)
 
 if [ "$#" -eq 0 ]; then
-  TEST_GROUP="${NEXT_TEST_GROUP-1/16}"
+  TEST_GROUP="${NEXT_TEST_GROUP-1/32}"
   TEST_CONCURRENCY="${NEXT_TEST_CONCURRENCY-2}"
 
   if [ -n "${TEST_GROUP}" ]; then

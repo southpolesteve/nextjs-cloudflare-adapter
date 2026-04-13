@@ -47,7 +47,7 @@ async function main() {
   const outputPath = path.resolve(
     outputPathArg || path.join(process.cwd(), 'reports', 'nextjs-adapter-suite-shards.json')
   )
-  const shardCount = shardCountArg ? Number.parseInt(shardCountArg, 10) : 16
+  const shardCount = shardCountArg ? Number.parseInt(shardCountArg, 10) : 32
 
   if (!Number.isFinite(shardCount) || shardCount <= 0) {
     throw new Error(`Invalid shard count: ${shardCountArg}`)
