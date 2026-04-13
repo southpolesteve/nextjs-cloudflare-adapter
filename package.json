@@ -3,27 +3,23 @@
   "version": "0.1.0",
   "description": "Next.js deployment adapter for Cloudflare Workers",
   "type": "module",
-  "main": "dist/adapter.js",
+  "main": "adapter/index.cjs",
   "exports": {
-    ".": "./dist/adapter.js",
-    "./cache-handler": "./dist/cache-handler.js"
+    ".": "./adapter/index.cjs"
   },
   "files": [
-    "dist"
+    "adapter"
   ],
   "scripts": {
-    "build": "node build.mjs",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@next/routing": "16.2.1",
-    "esbuild": "^0.25.0"
+    "test:nextjs:local": "bash ./scripts/test-nextjs-adapter-local.sh",
+    "test:nextjs:local:prepare": "NEXTJS_PREPARE=1 NEXTJS_PREPARE_ONLY=1 bash ./scripts/test-nextjs-adapter-local.sh",
+    "test:nextjs:status": "node ./scripts/nextjs-suite-status.mjs",
+    "test:nextjs:run-next": "node ./scripts/nextjs-suite-runner.mjs",
+    "test:nextjs:run-batch": "node ./scripts/nextjs-suite-batch.mjs",
+    "test:nextjs:plan-shards": "node ./scripts/nextjs-suite-shards.mjs"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250312.0",
-    "next": "^16.2.0",
-    "typescript": "^5.7.0",
-    "@types/node": "^22.0.0"
+    "wrangler": "4.77.0"
   },
   "peerDependencies": {
     "next": ">=16.2.0"
