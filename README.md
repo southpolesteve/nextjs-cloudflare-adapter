@@ -101,7 +101,7 @@ This repo follows the documented Next.js adapter testing flow:
 - [Testing adapters](https://nextjs.org/docs/app/api-reference/adapters/testing-adapters)
 - [Adapter path / adapter API](https://nextjs.org/docs/app/api-reference/config/next-config-js/adapterPath)
 
-The local and CI harnesses run against Next.js's deploy/adapters manifest at `test/deploy-tests-manifest.json` in a pinned Next.js checkout. In the `v16.2.2` checkout used here, that manifest expands to `795` suites total, so the GitHub Actions job fans out across `12` shards instead of trying to run everything serially in one job.
+The local and CI harnesses run against Next.js's deploy/adapters manifest at `test/deploy-tests-manifest.json` in a pinned Next.js checkout. In the `v16.2.2` checkout used here, that manifest expands to `795` suites total, so the GitHub Actions job fans out across `20` shards instead of trying to run everything serially in one job.
 
 ```bash
 # Clone a Next.js checkout once
@@ -114,7 +114,7 @@ npm run test:nextjs:local:prepare -- ../next.js
 npm run test:nextjs:local -- ../next.js
 
 # Run a specific shard from the official deploy/adapters manifest
-NEXT_TEST_GROUP=7/12 npm run test:nextjs:local -- ../next.js
+NEXT_TEST_GROUP=7/20 npm run test:nextjs:local -- ../next.js
 ```
 
 ## What the Next.js Adapter API Needs to Improve
