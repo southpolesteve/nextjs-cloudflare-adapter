@@ -99,32 +99,186 @@ function checkMissingConditions(conditions, url, headers) {
   return true
 }
 
+function matchesMiddlewareMatcherPath(matcher, pathname, url, headers) {
+  if (!matcher) {
+    return false
+  }
+
+  if (!checkMissingConditions(matcher.missing, url, headers)) {
+    return false
+  }
+
+  if (!checkHasConditions(matcher.has, url, headers).matched) {
+    return false
+  }
+
+  try {
+    return new RegExp(matcher.sourceRegex).test(pathname)
+  } catch {
+    return false
+  }
+}
+
+function getMiddlewareMatcherCandidates({
+  url,
+  matcher,
+  i18n,
+  basePath,
+  pendingLocale,
+}) {
+  const pathname = url.pathname || '/'
+  const candidates = new Set([pathname])
+
+  let decodedPathname = pathname
+
+  try {
+    decodedPathname = decodeURIComponent(pathname)
+    candidates.add(decodedPathname)
+  } catch {}
+
+  if (!i18n || matcher?.locale === false) {
+    return Array.from(candidates)
+  }
+
+  const pathnameWithoutBase =
+    basePath && pathname.startsWith(basePath)
+      ? pathname.slice(basePath.length) || '/'
+      : pathname
+  const normalizedPath = normalizeLocalePath(pathnameWithoutBase, i18n.locales)
+
+  if (normalizedPath.detectedLocale) {
+    return Array.from(candidates)
+  }
+
+  const localeToApply = pendingLocale || i18n.defaultLocale
+  const localizedPath =
+    pathnameWithoutBase === '/'
+      ? `${basePath}/${localeToApply}`
+      : `${basePath}/${localeToApply}${pathnameWithoutBase}`
+
+  candidates.add(localizedPath)
+
+  const sourcePath = matcher.source || ''
+  const pathSegments = pathnameWithoutBase.split('/').filter(Boolean)
+  const sourceSegments = sourcePath.split('?')[0].split('/').filter(Boolean)
+  const looksLikeInvalidLocalePrefixedMatch =
+    sourcePath &&
+    sourcePath !== '/' &&
+    pathSegments.length === sourceSegments.length + 1 &&
+    pathnameWithoutBase.endsWith(sourcePath)
+
+  if (looksLikeInvalidLocalePrefixedMatch) {
+    candidates.delete(pathname)
+    candidates.delete(decodedPathname)
+  }
+
+  return Array.from(candidates)
+}
+
+function shouldInvokeMiddleware({
+  url,
+  headers,
+  matchers,
+  i18n,
+  basePath,
+  pendingLocale,
+}) {
+  if (!Array.isArray(matchers) || matchers.length === 0) {
+    return true
+  }
+
+  return matchers.some((matcher) => {
+    const candidatePathnames = getMiddlewareMatcherCandidates({
+      url,
+      matcher,
+      i18n,
+      basePath,
+      pendingLocale,
+    })
+
+    for (const candidatePathname of candidatePathnames) {
+      if (matchesMiddlewareMatcherPath(matcher, candidatePathname, url, headers)) {
+        return true
+      }
+    }
+
+    return false
+  })
+}
+
 function replaceDestination(destination, regexMatches, captures) {
   let resolved = destination
+  const replacements = []
 
   if (regexMatches) {
     for (let index = 1; index < regexMatches.length; index += 1) {
       const value = regexMatches[index]
 
       if (value !== undefined) {
-        resolved = resolved.replace(new RegExp(`\\$${index}`, 'g'), value)
+        replacements.push([String(index), value])
       }
     }
 
     if (regexMatches.groups) {
       for (const [key, value] of Object.entries(regexMatches.groups)) {
         if (value !== undefined) {
-          resolved = resolved.replace(new RegExp(`\\$${key}`, 'g'), value)
+          replacements.push([key, value])
         }
       }
     }
   }
 
   for (const [key, value] of Object.entries(captures)) {
+    replacements.push([key, value])
+  }
+
+  replacements.sort((left, right) => right[0].length - left[0].length)
+
+  for (const [key, value] of replacements) {
     resolved = resolved.replace(new RegExp(`\\$${key}`, 'g'), value)
   }
 
   return resolved
+}
+
+function extractSourceParamNames(source) {
+  if (!source) {
+    return []
+  }
+
+  const parameterNames = []
+  const matcher = /:([A-Za-z0-9_]+)(?:\([^)]*\))?[?*+]?/g
+  let match
+
+  while ((match = matcher.exec(source)) !== null) {
+    parameterNames.push(match[1])
+  }
+
+  return parameterNames
+}
+
+function toSourceCaptures(route, regexMatches) {
+  if (!regexMatches) {
+    return {}
+  }
+
+  const parameterNames = extractSourceParamNames(route.source)
+
+  if (parameterNames.length === 0) {
+    return {}
+  }
+
+  const captures = {}
+
+  for (let index = 0; index < parameterNames.length; index += 1) {
+    const value = regexMatches[index + 1]
+
+    if (value !== undefined) {
+      captures[parameterNames[index]] = value
+    }
+  }
+
+  return captures
 }
 
 function isExternalDestination(destination) {
@@ -151,6 +305,18 @@ function applyDestination(url, destination) {
   return nextUrl
 }
 
+function applyRewriteUrl(url, rewriteUrl) {
+  const nextUrl = new URL(url.toString())
+  nextUrl.pathname = rewriteUrl.pathname
+  nextUrl.hash = rewriteUrl.hash
+
+  for (const [key, value] of rewriteUrl.searchParams.entries()) {
+    nextUrl.searchParams.set(key, value)
+  }
+
+  return nextUrl
+}
+
 function isRedirectStatus(status) {
   return Boolean(status && status >= 300 && status < 400)
 }
@@ -160,7 +326,7 @@ function hasRedirectHeaders(headers) {
   return lowerCaseKeys.includes('location') || lowerCaseKeys.includes('refresh')
 }
 
-function normalizeNextDataUrl(url, basePath, buildId) {
+function normalizeNextDataUrl(url, basePath, buildId, trailingSlash = false) {
   const nextUrl = new URL(url.toString())
   let pathname = nextUrl.pathname
   const prefix = `${basePath}/_next/data/${buildId}/`
@@ -173,13 +339,23 @@ function normalizeNextDataUrl(url, basePath, buildId) {
     }
 
     pathname = basePath ? `${basePath}/${normalized}` : `/${normalized}`
+
+    if (
+      trailingSlash &&
+      pathname !== '/' &&
+      !pathname.endsWith('/') &&
+      !pathname.split('/').pop()?.includes('.')
+    ) {
+      pathname = `${pathname}/`
+    }
+
     nextUrl.pathname = pathname
   }
 
   return nextUrl
 }
 
-function denormalizeNextDataUrl(url, basePath, buildId) {
+function denormalizeNextDataUrl(url, basePath, buildId, trailingSlash = false) {
   const nextUrl = new URL(url.toString())
   let pathname = nextUrl.pathname
   const prefix = `${basePath}/_next/data/${buildId}/`
@@ -189,6 +365,10 @@ function denormalizeNextDataUrl(url, basePath, buildId) {
 
     if (basePath && pathname.startsWith(basePath)) {
       normalized = pathname.slice(basePath.length)
+    }
+
+    if (trailingSlash && normalized !== '/' && normalized.endsWith('/')) {
+      normalized = normalized.slice(0, -1)
     }
 
     pathname = `${basePath}/_next/data/${buildId}${normalized}.json`
@@ -247,6 +427,15 @@ function normalizeLocalePath(pathname, locales) {
     pathname: pathnameWithoutLocale,
     detectedLocale,
   }
+}
+
+function normalizeRepeatedSlashes(pathname) {
+  if (typeof pathname !== 'string' || !pathname.includes('//')) {
+    return pathname
+  }
+
+  const normalizedPathname = pathname.replace(/\/{2,}/g, '/')
+  return normalizedPathname || '/'
 }
 
 function getAcceptLanguageLocale(header, locales) {
@@ -398,8 +587,20 @@ function detectLocale({
   }
 }
 
-function matchRoute(route, url, headers) {
-  const regex = new RegExp(route.sourceRegex)
+function createRouteRegExp(sourceRegex, caseSensitive = false) {
+  return new RegExp(sourceRegex, caseSensitive ? '' : 'i')
+}
+
+function matchesResolvedPathname(left, right, caseSensitive = false) {
+  if (caseSensitive) {
+    return left === right
+  }
+
+  return left.toLowerCase() === right.toLowerCase()
+}
+
+function matchRoute(route, url, headers, caseSensitive = false) {
+  const regex = createRouteRegExp(route.sourceRegex, caseSensitive)
   const regexMatches = url.pathname.match(regex)
 
   if (!regexMatches) {
@@ -415,14 +616,20 @@ function matchRoute(route, url, headers) {
     return { matched: false }
   }
 
+  const sourceCaptures = toSourceCaptures(route, regexMatches)
+  const destinationCaptures = {
+    ...sourceCaptures,
+    ...hasConditions.captures,
+  }
+
   const destination = route.destination
-    ? replaceDestination(route.destination, regexMatches, hasConditions.captures)
+    ? replaceDestination(route.destination, regexMatches, destinationCaptures)
     : undefined
   const responseHeaders = route.headers
     ? Object.fromEntries(
         Object.entries(route.headers).map(([key, value]) => [
-          replaceDestination(key, regexMatches, hasConditions.captures),
-          replaceDestination(value, regexMatches, hasConditions.captures),
+          replaceDestination(key, regexMatches, destinationCaptures),
+          replaceDestination(value, regexMatches, destinationCaptures),
         ])
       )
     : undefined
@@ -432,16 +639,16 @@ function matchRoute(route, url, headers) {
     destination,
     headers: responseHeaders,
     regexMatches,
-    hasCaptures: hasConditions.captures,
+    hasCaptures: destinationCaptures,
   }
 }
 
-function processRoutes(routes, url, headers, resolvedHeaders, origin) {
+function processRoutes(routes, url, headers, resolvedHeaders, origin, caseSensitive = false) {
   let nextUrl = url
   let status
 
   for (const route of routes) {
-    const result = matchRoute(route, nextUrl, headers)
+    const result = matchRoute(route, nextUrl, headers, caseSensitive)
 
     if (!result.matched) {
       continue
@@ -516,9 +723,24 @@ function processRoutes(routes, url, headers, resolvedHeaders, origin) {
   }
 }
 
-function matchesPathname(pathname, pathnames) {
+function matchesPathname(pathname, pathnames, trailingSlash = false, caseSensitive = false) {
+  const normalizedPathname =
+    pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
+
   for (const candidate of pathnames) {
-    if (pathname === candidate) {
+    if (
+      matchesResolvedPathname(pathname, candidate, caseSensitive) ||
+      matchesResolvedPathname(normalizedPathname, candidate, caseSensitive)
+    ) {
+      return candidate
+    }
+
+    if (
+      trailingSlash &&
+      pathname !== '/' &&
+      pathname.endsWith('/') &&
+      matchesResolvedPathname(pathname.slice(0, -1), candidate, caseSensitive)
+    ) {
       return candidate
     }
   }
@@ -584,16 +806,20 @@ function withResolvedInvocationTarget({
     ...result,
     resolvedPathname,
     resolvedQuery,
+    resolvedRequestUrl: url,
     invocationTarget: {
       pathname: invocationPathname,
       query: resolvedQuery,
+      rawQuery: url.search,
     },
   }
 }
 
-function matchDynamicRoute(pathname, route) {
-  const regex = new RegExp(route.sourceRegex)
-  const regexMatches = pathname.match(regex)
+function matchDynamicRoute(pathname, route, trailingSlash = false, caseSensitive = false) {
+  const nextPathname =
+    trailingSlash && pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
+  const regex = createRouteRegExp(route.sourceRegex, caseSensitive)
+  const regexMatches = nextPathname.match(regex)
 
   if (!regexMatches) {
     return { matched: false }
@@ -618,11 +844,107 @@ function matchDynamicRoute(pathname, route) {
   }
 }
 
-function applyOnMatchHeaders(routes, url, headers, baseHeaders) {
+const dynamicPathnameMatcherCache = new Map()
+
+function escapeRegExp(value) {
+  return String(value).replace(/[|\\{}()[\]^$+?.]/g, '\\$&')
+}
+
+function createDynamicPathnameMatcher(pathname, caseSensitive = false) {
+  const cacheKey = `${caseSensitive ? '1' : '0'}:${pathname}`
+
+  if (dynamicPathnameMatcherCache.has(cacheKey)) {
+    return dynamicPathnameMatcherCache.get(cacheKey)
+  }
+
+  if (typeof pathname !== 'string' || !pathname.includes('[')) {
+    dynamicPathnameMatcherCache.set(cacheKey, null)
+    return null
+  }
+
+  const paramNames = []
+  let pattern = '^'
+
+  if (pathname === '/') {
+    pattern += '/'
+  } else {
+    for (const segment of pathname.split('/').slice(1)) {
+      const optionalCatchAllMatch = segment.match(/^\[\[\.\.\.([^\]/]+)\]\]$/)
+
+      if (optionalCatchAllMatch) {
+        paramNames.push(optionalCatchAllMatch[1])
+        pattern += '(?:/(.+?))?'
+        continue
+      }
+
+      const catchAllMatch = segment.match(/^\[\.\.\.([^\]/]+)\]$/)
+
+      if (catchAllMatch) {
+        paramNames.push(catchAllMatch[1])
+        pattern += '/(.+?)'
+        continue
+      }
+
+      const dynamicMatch = segment.match(/^\[([^\]/]+)\]$/)
+
+      if (dynamicMatch) {
+        paramNames.push(dynamicMatch[1])
+        pattern += '/([^/]+?)'
+        continue
+      }
+
+      pattern += `/${escapeRegExp(segment)}`
+    }
+  }
+
+  pattern += '(?:/)?$'
+
+  const matcher = {
+    regex: new RegExp(pattern, caseSensitive ? '' : 'i'),
+    paramNames,
+  }
+
+  dynamicPathnameMatcherCache.set(cacheKey, matcher)
+  return matcher
+}
+
+function matchDynamicPathname(pathname, candidatePathname, trailingSlash = false, caseSensitive = false) {
+  const matcher = createDynamicPathnameMatcher(candidatePathname, caseSensitive)
+
+  if (!matcher) {
+    return { matched: false }
+  }
+
+  const nextPathname =
+    trailingSlash && pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
+  const regexMatches = nextPathname.match(matcher.regex)
+
+  if (!regexMatches) {
+    return { matched: false }
+  }
+
+  const params = {}
+
+  for (let index = 0; index < matcher.paramNames.length; index += 1) {
+    const value = regexMatches[index + 1]
+
+    if (value !== undefined) {
+      params[matcher.paramNames[index]] = value
+    }
+  }
+
+  return {
+    matched: true,
+    params,
+    regexMatches,
+  }
+}
+
+function applyOnMatchHeaders(routes, url, headers, baseHeaders, caseSensitive = false) {
   const resolvedHeaders = new Headers(baseHeaders)
 
   for (const route of routes) {
-    const result = matchRoute(route, url, headers)
+    const result = matchRoute(route, url, headers, caseSensitive)
 
     if (!result.matched || !result.headers) {
       continue
@@ -636,6 +958,41 @@ function applyOnMatchHeaders(routes, url, headers, baseHeaders) {
   return resolvedHeaders
 }
 
+function normalizeComparablePathname(pathname) {
+  return pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
+}
+
+function canMatchDynamicPrerenderPath(
+  dynamicPrerenderRoutes,
+  resolvedPathname,
+  concretePathname,
+  caseSensitive = false
+) {
+  const routeConfig = dynamicPrerenderRoutes?.[resolvedPathname]
+
+  if (!routeConfig || routeConfig.fallback !== false) {
+    return true
+  }
+
+  const allowedPathnames = resolvedPathname.endsWith('.rsc')
+    ? routeConfig.dataRoutePathnames
+    : routeConfig.pathnames
+
+  if (!Array.isArray(allowedPathnames) || allowedPathnames.length === 0) {
+    return false
+  }
+
+  const normalizedConcretePathname = normalizeComparablePathname(concretePathname)
+
+  return allowedPathnames.some((pathname) =>
+    matchesResolvedPathname(
+      normalizeComparablePathname(pathname),
+      normalizedConcretePathname,
+      caseSensitive
+    )
+  )
+}
+
 function checkDynamicRoutes(
   dynamicRoutes,
   url,
@@ -643,10 +1000,13 @@ function checkDynamicRoutes(
   requestHeaders,
   resolvedHeaders,
   onMatchRoutes,
+  trailingSlash,
+  caseSensitive,
   basePath,
   buildId,
   shouldNormalizeNextData,
-  isNextDataRequest
+  isNextDataRequest,
+  dynamicPrerenderRoutes = {}
 ) {
   let nextUrl = url
 
@@ -655,7 +1015,7 @@ function checkDynamicRoutes(
   }
 
   for (const route of dynamicRoutes) {
-    const dynamicMatch = matchDynamicRoute(nextUrl.pathname, route)
+    const dynamicMatch = matchDynamicRoute(nextUrl.pathname, route, trailingSlash, caseSensitive)
 
     if (!dynamicMatch.matched) {
       continue
@@ -672,9 +1032,57 @@ function checkDynamicRoutes(
       ? replaceDestination(route.destination, dynamicMatch.regexMatches || null, hasConditions.captures)
       : undefined
     const pathname = destination ? destination.split('?')[0] : nextUrl.pathname
-    const matchedPathname = matchesPathname(pathname, pathnames)
+    let matchedConcretePathname = pathname
+    let matchedPathname = matchesPathname(pathname, pathnames, trailingSlash, caseSensitive)
+    let invocationPathname = nextUrl.pathname
+
+    if (!matchedPathname && buildId) {
+      const normalizedNextDataPathname = normalizeNextDataUrl(
+        new URL(`http://localhost${pathname}`),
+        basePath,
+        buildId,
+        trailingSlash
+      ).pathname
+
+      if (normalizedNextDataPathname !== pathname) {
+        matchedPathname = matchesPathname(
+          normalizedNextDataPathname,
+          pathnames,
+          trailingSlash,
+          caseSensitive
+        )
+
+        if (matchedPathname) {
+          matchedConcretePathname = normalizedNextDataPathname
+        }
+      }
+    }
+
+    if (buildId) {
+      const normalizedInvocationPathname = normalizeNextDataUrl(
+        nextUrl,
+        basePath,
+        buildId,
+        trailingSlash
+      ).pathname
+
+      if (normalizedInvocationPathname !== nextUrl.pathname) {
+        invocationPathname = normalizedInvocationPathname
+      }
+    }
 
     if (!matchedPathname) {
+      continue
+    }
+
+    if (
+      !canMatchDynamicPrerenderPath(
+        dynamicPrerenderRoutes,
+        matchedPathname,
+        matchedConcretePathname,
+        caseSensitive
+      )
+    ) {
       continue
     }
 
@@ -683,7 +1091,8 @@ function checkDynamicRoutes(
       onMatchRoutes,
       destinationUrl,
       requestHeaders,
-      resolvedHeaders
+      resolvedHeaders,
+      caseSensitive
     )
 
     return {
@@ -695,7 +1104,7 @@ function checkDynamicRoutes(
         },
         url: destinationUrl,
         resolvedPathname: matchedPathname,
-        invocationPathname: nextUrl.pathname,
+        invocationPathname,
       }),
       resetUrl: nextUrl,
     }
@@ -704,31 +1113,155 @@ function checkDynamicRoutes(
   return { matched: false }
 }
 
+function checkDynamicPathnameMatches(
+  pathnames,
+  url,
+  requestHeaders,
+  resolvedHeaders,
+  onMatchRoutes,
+  trailingSlash,
+  caseSensitive,
+  dynamicPrerenderRoutes = {}
+) {
+  for (const pathname of pathnames) {
+    const dynamicMatch = matchDynamicPathname(
+      url.pathname,
+      pathname,
+      trailingSlash,
+      caseSensitive
+    )
+
+    if (!dynamicMatch.matched) {
+      continue
+    }
+
+    if (
+      !canMatchDynamicPrerenderPath(
+        dynamicPrerenderRoutes,
+        pathname,
+        url.pathname,
+        caseSensitive
+      )
+    ) {
+      continue
+    }
+
+    const responseHeaders = applyOnMatchHeaders(
+      onMatchRoutes,
+      url,
+      requestHeaders,
+      resolvedHeaders,
+      caseSensitive
+    )
+
+    return {
+      matched: true,
+      result: withResolvedInvocationTarget({
+        result: {
+          routeMatches: dynamicMatch.params,
+          resolvedHeaders: responseHeaders,
+        },
+        url,
+        resolvedPathname: pathname,
+        invocationPathname: url.pathname,
+      }),
+    }
+  }
+
+  return { matched: false }
+}
+
+function hasDirectRouteMatch(
+  url,
+  pathnames,
+  dynamicRoutes,
+  requestHeaders,
+  trailingSlash,
+  caseSensitive,
+  basePath,
+  buildId,
+  shouldNormalizeNextData,
+  isNextDataRequest,
+  dynamicPrerenderRoutes = {}
+) {
+  if (matchesPathname(url.pathname, pathnames, trailingSlash, caseSensitive)) {
+    return true
+  }
+
+  if (!Array.isArray(dynamicRoutes) || dynamicRoutes.length === 0) {
+    return checkDynamicPathnameMatches(
+      pathnames,
+      url,
+      requestHeaders,
+      new Headers(),
+      [],
+      trailingSlash,
+      caseSensitive,
+      dynamicPrerenderRoutes
+    ).matched
+  }
+
+  return checkDynamicRoutes(
+    dynamicRoutes,
+    url,
+    pathnames,
+    requestHeaders,
+    new Headers(),
+    [],
+    trailingSlash,
+    caseSensitive,
+    basePath,
+    buildId,
+    shouldNormalizeNextData,
+    isNextDataRequest,
+    dynamicPrerenderRoutes
+  ).matched || checkDynamicPathnameMatches(
+    pathnames,
+    url,
+    requestHeaders,
+    new Headers(),
+    [],
+    trailingSlash,
+    caseSensitive,
+    dynamicPrerenderRoutes
+  ).matched
+}
+
 export async function resolveRoutes({
   url,
   buildId,
   basePath,
+  nextConfig,
+  trailingSlash,
+  preferDynamicRoutes = false,
   requestBody,
   headers,
   pathnames,
+  dynamicPrerenderRoutes = {},
   i18n,
   routes,
+  middlewareMatchers,
   invokeMiddleware,
 }) {
   const { shouldNormalizeNextData } = routes
   let requestUrl = new URL(url.toString())
   let requestHeaders = new Headers(headers)
+  requestHeaders.delete('x-middleware-set-cookie')
   const resolvedHeaders = new Headers()
   let status
   const origin = url.origin
   let isNextDataRequest = false
+  let pendingLocale = null
+  let appliedPendingLocale = false
+  const caseSensitive = !!nextConfig?.experimental?.caseSensitiveRoutes
+  requestUrl.pathname = normalizeRepeatedSlashes(requestUrl.pathname)
 
   if (shouldNormalizeNextData) {
     const nextDataPrefix = `${basePath}/_next/data/${buildId}/`
     isNextDataRequest = url.pathname.startsWith(nextDataPrefix)
 
     if (isNextDataRequest) {
-      requestUrl = normalizeNextDataUrl(requestUrl, basePath, buildId)
+      requestUrl = normalizeNextDataUrl(requestUrl, basePath, buildId, trailingSlash)
     }
   }
 
@@ -745,9 +1278,28 @@ export async function resolveRoutes({
       const localeInPath = Boolean(normalizedPath.detectedLocale)
       const domainLocale = detectDomainLocale(i18n.domains, hostname)
       const defaultLocale = domainLocale?.defaultLocale || i18n.defaultLocale
+      const directRouteMatch = hasDirectRouteMatch(
+        requestUrl,
+        pathnames,
+        routes.dynamicRoutes,
+        requestHeaders,
+        trailingSlash,
+        caseSensitive,
+        basePath,
+        buildId,
+        shouldNormalizeNextData,
+        isNextDataRequest,
+        dynamicPrerenderRoutes
+      )
       let locale = normalizedPath.detectedLocale || defaultLocale
 
-      if (i18n.localeDetection !== false && !localeInPath) {
+      const shouldApplyPreferredLocaleDetection = pathname === '/'
+
+      if (
+        shouldApplyPreferredLocaleDetection &&
+        i18n.localeDetection !== false &&
+        !localeInPath
+      ) {
         const detected = detectLocale({
           pathname,
           hostname,
@@ -792,7 +1344,17 @@ export async function resolveRoutes({
       }
 
       if (!localeInPath) {
-        requestUrl.pathname = `${basePath}/${locale || domainLocale?.defaultLocale || i18n.defaultLocale}${pathname}`
+        const shouldInjectLocalePrefix = !(locale === defaultLocale && directRouteMatch)
+
+        if (shouldInjectLocalePrefix) {
+          const localeToApply = locale || domainLocale?.defaultLocale || i18n.defaultLocale
+
+          if (invokeMiddleware) {
+            pendingLocale = localeToApply
+          } else {
+            requestUrl.pathname = `${basePath}/${localeToApply}${pathname}`
+          }
+        }
       }
     }
   }
@@ -802,7 +1364,8 @@ export async function resolveRoutes({
     requestUrl,
     requestHeaders,
     resolvedHeaders,
-    origin
+    origin,
+    caseSensitive
   )
 
   if (beforeMiddlewareResult.status) {
@@ -810,10 +1373,27 @@ export async function resolveRoutes({
   }
 
   if (beforeMiddlewareResult.redirect) {
-    return {
-      redirect: beforeMiddlewareResult.redirect,
-      resolvedHeaders,
-      status,
+    const normalizedPathname =
+      requestUrl.pathname !== '/' && requestUrl.pathname.endsWith('/')
+        ? requestUrl.pathname.slice(0, -1)
+        : null
+    const canCollapseTrailingSlashRedirect =
+      Boolean(normalizedPathname) &&
+      requestUrl.search.length > 0 &&
+      beforeMiddlewareResult.redirect.url.origin === requestUrl.origin &&
+      beforeMiddlewareResult.redirect.url.pathname === normalizedPathname &&
+      beforeMiddlewareResult.redirect.url.search === requestUrl.search &&
+      matchesPathname(normalizedPathname, pathnames, trailingSlash, caseSensitive)
+
+    if (canCollapseTrailingSlashRedirect) {
+      requestUrl = new URL(beforeMiddlewareResult.redirect.url.toString())
+      status = undefined
+    } else {
+      return {
+        redirect: beforeMiddlewareResult.redirect,
+        resolvedHeaders,
+        status,
+      }
     }
   }
 
@@ -827,60 +1407,142 @@ export async function resolveRoutes({
 
   requestUrl = beforeMiddlewareResult.url
 
-  if (isNextDataRequest && shouldNormalizeNextData) {
-    requestUrl = denormalizeNextDataUrl(requestUrl, basePath, buildId)
-  }
-
-  const middlewareResult = await invokeMiddleware({
-    url: requestUrl,
-    headers: requestHeaders,
-    requestBody,
-  })
-
-  if (middlewareResult.bodySent) {
-    return { middlewareResponded: true }
-  }
-
-  if (middlewareResult.requestHeaders) {
-    requestHeaders = new Headers(middlewareResult.requestHeaders)
-  }
-
-  if (middlewareResult.responseHeaders) {
-    middlewareResult.responseHeaders.forEach((value, key) => {
-      if (key.toLowerCase() === 'set-cookie') {
-        resolvedHeaders.append(key, value)
-      } else {
-        resolvedHeaders.set(key, value)
-      }
+  if (
+    shouldInvokeMiddleware({
+      url: requestUrl,
+      headers: requestHeaders,
+      matchers: middlewareMatchers,
+      i18n,
+      basePath,
+      pendingLocale,
     })
-  }
+  ) {
+    const middlewareResult = await invokeMiddleware({
+      url: requestUrl,
+      headers: requestHeaders,
+      requestBody,
+    })
 
-  if (middlewareResult.redirect) {
-    if (!resolvedHeaders.has('location')) {
-      resolvedHeaders.set('Location', middlewareResult.redirect.url.toString())
+    if (middlewareResult.bodySent) {
+      return { middlewareResponded: true }
     }
 
-    return {
-      redirect: middlewareResult.redirect,
-      resolvedHeaders,
-      status: middlewareResult.redirect.status,
+    if (middlewareResult.requestHeaders) {
+      requestHeaders = new Headers(middlewareResult.requestHeaders)
     }
-  }
 
-  if (middlewareResult.rewrite) {
-    requestUrl = middlewareResult.rewrite
+    if (middlewareResult.responseHeaders) {
+      middlewareResult.responseHeaders.forEach((value, key) => {
+        if (key.toLowerCase() === 'set-cookie') {
+          resolvedHeaders.append(key, value)
+        } else {
+          resolvedHeaders.set(key, value)
+        }
+      })
+    }
 
-    if (requestUrl.origin !== origin) {
+    if (middlewareResult.redirect) {
+      if (!resolvedHeaders.has('location')) {
+        resolvedHeaders.set('Location', middlewareResult.redirect.url.toString())
+      }
+
       return {
-        externalRewrite: requestUrl,
+        redirect: middlewareResult.redirect,
+        resolvedHeaders,
+        status: middlewareResult.redirect.status,
+      }
+    }
+
+    if (middlewareResult.rewrite) {
+      const rewriteUrl = middlewareResult.rewrite
+      pendingLocale = null
+
+      if (rewriteUrl.origin !== origin) {
+        return {
+          externalRewrite: rewriteUrl,
+          resolvedHeaders,
+          status,
+        }
+      }
+
+      requestUrl = applyRewriteUrl(requestUrl, rewriteUrl)
+    }
+  }
+
+  if (isNextDataRequest && shouldNormalizeNextData) {
+    requestUrl = normalizeNextDataUrl(requestUrl, basePath, buildId, trailingSlash)
+  }
+
+  const matchedPathHeader = requestHeaders.get('x-matched-path')
+
+  if (matchedPathHeader && !requestHeaders.get('x-middleware-rewrite')) {
+    try {
+      const matchedUrl = new URL(getRelativeURL(matchedPathHeader, requestUrl.toString()), requestUrl)
+      let matchedPathname = matchedUrl.pathname
+
+      if (
+        !isNextDataRequest &&
+        i18n?.defaultLocale &&
+        matchedPathname === `${basePath}/404` &&
+        matchesPathname(
+          `${basePath}/${i18n.defaultLocale}/404`,
+          pathnames,
+          trailingSlash,
+          caseSensitive
+        )
+      ) {
+        matchedPathname = `${basePath}/${i18n.defaultLocale}/404`
+      }
+
+      requestUrl.pathname = matchedPathname
+      requestUrl.search = matchedUrl.search || requestUrl.search
+      pendingLocale = null
+    } catch {}
+  }
+
+  if (pendingLocale && i18n && !isNextDataRequest) {
+    const pathname = requestUrl.pathname.startsWith(basePath)
+      ? requestUrl.pathname.slice(basePath.length) || '/'
+      : requestUrl.pathname
+    const normalizedPath = normalizeLocalePath(pathname, i18n.locales)
+
+    if (!normalizedPath.detectedLocale) {
+      requestUrl.pathname = `${basePath}/${pendingLocale}${pathname}`
+      appliedPendingLocale = true
+    }
+  }
+
+  if (appliedPendingLocale) {
+    const localizedBeforeMiddlewareResult = processRoutes(
+      routes.beforeMiddleware,
+      requestUrl,
+      requestHeaders,
+      resolvedHeaders,
+      origin,
+      caseSensitive
+    )
+
+    if (localizedBeforeMiddlewareResult.status) {
+      status = localizedBeforeMiddlewareResult.status
+    }
+
+    if (localizedBeforeMiddlewareResult.redirect) {
+      return {
+        redirect: localizedBeforeMiddlewareResult.redirect,
         resolvedHeaders,
         status,
       }
     }
-  }
 
-  if (isNextDataRequest && shouldNormalizeNextData) {
-    requestUrl = normalizeNextDataUrl(requestUrl, basePath, buildId)
+    if (localizedBeforeMiddlewareResult.externalRewrite) {
+      return {
+        externalRewrite: localizedBeforeMiddlewareResult.externalRewrite,
+        resolvedHeaders,
+        status,
+      }
+    }
+
+    requestUrl = localizedBeforeMiddlewareResult.url
   }
 
   const beforeFilesResult = processRoutes(
@@ -888,7 +1550,8 @@ export async function resolveRoutes({
     requestUrl,
     requestHeaders,
     resolvedHeaders,
-    origin
+    origin,
+    caseSensitive
   )
 
   if (beforeFilesResult.status) {
@@ -914,56 +1577,65 @@ export async function resolveRoutes({
   requestUrl = beforeFilesResult.url
 
   if (isNextDataRequest && shouldNormalizeNextData) {
-    requestUrl = denormalizeNextDataUrl(requestUrl, basePath, buildId)
+    requestUrl = denormalizeNextDataUrl(requestUrl, basePath, buildId, trailingSlash)
   }
 
-  let resolvedPathname = matchesPathname(requestUrl.pathname, pathnames)
+  let resolvedPathname = matchesPathname(requestUrl.pathname, pathnames, trailingSlash, caseSensitive)
 
   if (resolvedPathname) {
-    for (const route of routes.dynamicRoutes) {
-      const dynamicMatch = matchDynamicRoute(requestUrl.pathname, route)
-
-      if (!dynamicMatch.matched) {
-        continue
-      }
-
-      const hasConditions = checkHasConditions(route.has, requestUrl, requestHeaders)
-      const missingConditions = checkMissingConditions(route.missing, requestUrl, requestHeaders)
-
-      if (!hasConditions.matched || !missingConditions) {
-        continue
-      }
-
-      const destination = route.destination
-        ? replaceDestination(route.destination, dynamicMatch.regexMatches || null, hasConditions.captures)
-        : undefined
-      const destinationUrl = destination
-        ? mergeDestinationQueryIntoUrl(requestUrl, destination)
-        : requestUrl
-      const responseHeaders = applyOnMatchHeaders(
-        routes.onMatch,
-        destinationUrl,
+    if (preferDynamicRoutes) {
+      const dynamicCheck = checkDynamicRoutes(
+        routes.dynamicRoutes,
+        requestUrl,
+        pathnames,
         requestHeaders,
-        resolvedHeaders
+        resolvedHeaders,
+        routes.onMatch,
+        trailingSlash,
+        caseSensitive,
+        basePath,
+        buildId,
+        shouldNormalizeNextData,
+        isNextDataRequest,
+        dynamicPrerenderRoutes
       )
 
-      return withResolvedInvocationTarget({
-        result: {
-          routeMatches: dynamicMatch.params,
-          resolvedHeaders: responseHeaders,
+      if (dynamicCheck.matched && dynamicCheck.result) {
+        if (dynamicCheck.resetUrl) {
+          requestUrl = dynamicCheck.resetUrl
+        }
+
+        return {
+          ...dynamicCheck.result,
           status,
-        },
-        url: destinationUrl,
-        resolvedPathname,
-        invocationPathname: requestUrl.pathname,
-      })
+        }
+      }
+
+      const dynamicPathnameCheck = checkDynamicPathnameMatches(
+        pathnames,
+        requestUrl,
+        requestHeaders,
+        resolvedHeaders,
+        routes.onMatch,
+        trailingSlash,
+        caseSensitive,
+        dynamicPrerenderRoutes
+      )
+
+      if (dynamicPathnameCheck.matched && dynamicPathnameCheck.result) {
+        return {
+          ...dynamicPathnameCheck.result,
+          status,
+        }
+      }
     }
 
     const responseHeaders = applyOnMatchHeaders(
       routes.onMatch,
       requestUrl,
       requestHeaders,
-      resolvedHeaders
+      resolvedHeaders,
+      caseSensitive
     )
 
     return withResolvedInvocationTarget({
@@ -978,11 +1650,11 @@ export async function resolveRoutes({
   }
 
   if (isNextDataRequest && shouldNormalizeNextData) {
-    requestUrl = normalizeNextDataUrl(requestUrl, basePath, buildId)
+    requestUrl = normalizeNextDataUrl(requestUrl, basePath, buildId, trailingSlash)
   }
 
   for (const route of routes.afterFiles) {
-    const result = matchRoute(route, requestUrl, requestHeaders)
+    const result = matchRoute(route, requestUrl, requestHeaders, caseSensitive)
 
     if (!result.matched) {
       continue
@@ -1035,6 +1707,39 @@ export async function resolveRoutes({
       }
     }
 
+    let filesystemUrl = requestUrl
+
+    if (isNextDataRequest && shouldNormalizeNextData) {
+      filesystemUrl = denormalizeNextDataUrl(requestUrl, basePath, buildId, trailingSlash)
+    }
+
+    resolvedPathname = matchesPathname(
+      filesystemUrl.pathname,
+      pathnames,
+      trailingSlash,
+      caseSensitive
+    )
+
+    if (resolvedPathname) {
+      const responseHeaders = applyOnMatchHeaders(
+        routes.onMatch,
+        filesystemUrl,
+        requestHeaders,
+        resolvedHeaders,
+        caseSensitive
+      )
+
+      return withResolvedInvocationTarget({
+        result: {
+          resolvedHeaders: responseHeaders,
+          status,
+        },
+        url: filesystemUrl,
+        resolvedPathname,
+        invocationPathname: filesystemUrl.pathname,
+      })
+    }
+
     const dynamicCheck = checkDynamicRoutes(
       routes.dynamicRoutes,
       requestUrl,
@@ -1042,10 +1747,13 @@ export async function resolveRoutes({
       requestHeaders,
       resolvedHeaders,
       routes.onMatch,
+      trailingSlash,
+      caseSensitive,
       basePath,
       buildId,
       shouldNormalizeNextData,
-      isNextDataRequest
+      isNextDataRequest,
+      dynamicPrerenderRoutes
     )
 
     if (dynamicCheck.matched && dynamicCheck.result) {
@@ -1059,36 +1767,32 @@ export async function resolveRoutes({
       }
     }
 
-    let filesystemUrl = requestUrl
+    const dynamicPathnameCheck = checkDynamicPathnameMatches(
+      pathnames,
+      requestUrl,
+      requestHeaders,
+      resolvedHeaders,
+      routes.onMatch,
+      trailingSlash,
+      caseSensitive,
+      dynamicPrerenderRoutes
+    )
 
-    if (isNextDataRequest && shouldNormalizeNextData) {
-      filesystemUrl = denormalizeNextDataUrl(requestUrl, basePath, buildId)
-    }
-
-    resolvedPathname = matchesPathname(filesystemUrl.pathname, pathnames)
-
-    if (resolvedPathname) {
-      const responseHeaders = applyOnMatchHeaders(
-        routes.onMatch,
-        filesystemUrl,
-        requestHeaders,
-        resolvedHeaders
-      )
-
-      return withResolvedInvocationTarget({
-        result: {
-          resolvedHeaders: responseHeaders,
-          status,
-        },
-        url: filesystemUrl,
-        resolvedPathname,
-        invocationPathname: filesystemUrl.pathname,
-      })
+    if (dynamicPathnameCheck.matched && dynamicPathnameCheck.result) {
+      return {
+        ...dynamicPathnameCheck.result,
+        status,
+      }
     }
   }
 
   for (const route of routes.dynamicRoutes) {
-    const dynamicMatch = matchDynamicRoute(requestUrl.pathname, route)
+    const dynamicMatch = matchDynamicRoute(
+      requestUrl.pathname,
+      route,
+      trailingSlash,
+      caseSensitive
+    )
 
     if (!dynamicMatch.matched) {
       continue
@@ -1105,10 +1809,58 @@ export async function resolveRoutes({
       ? replaceDestination(route.destination, dynamicMatch.regexMatches || null, hasConditions.captures)
       : undefined
     const pathname = destination ? destination.split('?')[0] : requestUrl.pathname
+    let matchedConcretePathname = pathname
+    let invocationPathname = requestUrl.pathname
 
-    resolvedPathname = matchesPathname(pathname, pathnames)
+    resolvedPathname = matchesPathname(pathname, pathnames, trailingSlash, caseSensitive)
+
+    if (!resolvedPathname && buildId) {
+      const normalizedNextDataPathname = normalizeNextDataUrl(
+        new URL(`http://localhost${pathname}`),
+        basePath,
+        buildId,
+        trailingSlash
+      ).pathname
+
+      if (normalizedNextDataPathname !== pathname) {
+        resolvedPathname = matchesPathname(
+          normalizedNextDataPathname,
+          pathnames,
+          trailingSlash,
+          caseSensitive
+        )
+
+        if (resolvedPathname) {
+          matchedConcretePathname = normalizedNextDataPathname
+        }
+      }
+    }
+
+    if (buildId) {
+      const normalizedInvocationPathname = normalizeNextDataUrl(
+        requestUrl,
+        basePath,
+        buildId,
+        trailingSlash
+      ).pathname
+
+      if (normalizedInvocationPathname !== requestUrl.pathname) {
+        invocationPathname = normalizedInvocationPathname
+      }
+    }
 
     if (!resolvedPathname) {
+      continue
+    }
+
+    if (
+      !canMatchDynamicPrerenderPath(
+        dynamicPrerenderRoutes,
+        resolvedPathname,
+        matchedConcretePathname,
+        caseSensitive
+      )
+    ) {
       continue
     }
 
@@ -1119,7 +1871,8 @@ export async function resolveRoutes({
       routes.onMatch,
       destinationUrl,
       requestHeaders,
-      resolvedHeaders
+      resolvedHeaders,
+      caseSensitive
     )
 
     return withResolvedInvocationTarget({
@@ -1130,12 +1883,30 @@ export async function resolveRoutes({
       },
       url: destinationUrl,
       resolvedPathname,
-      invocationPathname: requestUrl.pathname,
+      invocationPathname,
     })
   }
 
+  const dynamicPathnameCheck = checkDynamicPathnameMatches(
+    pathnames,
+    requestUrl,
+    requestHeaders,
+    resolvedHeaders,
+    routes.onMatch,
+    trailingSlash,
+    caseSensitive,
+    dynamicPrerenderRoutes
+  )
+
+  if (dynamicPathnameCheck.matched && dynamicPathnameCheck.result) {
+    return {
+      ...dynamicPathnameCheck.result,
+      status,
+    }
+  }
+
   for (const route of routes.fallback) {
-    const result = matchRoute(route, requestUrl, requestHeaders)
+    const result = matchRoute(route, requestUrl, requestHeaders, caseSensitive)
 
     if (!result.matched) {
       continue
@@ -1188,6 +1959,39 @@ export async function resolveRoutes({
       }
     }
 
+    let filesystemUrl = requestUrl
+
+    if (isNextDataRequest && shouldNormalizeNextData) {
+      filesystemUrl = denormalizeNextDataUrl(requestUrl, basePath, buildId, trailingSlash)
+    }
+
+    resolvedPathname = matchesPathname(
+      filesystemUrl.pathname,
+      pathnames,
+      trailingSlash,
+      caseSensitive
+    )
+
+    if (resolvedPathname) {
+      const responseHeaders = applyOnMatchHeaders(
+        routes.onMatch,
+        filesystemUrl,
+        requestHeaders,
+        resolvedHeaders,
+        caseSensitive
+      )
+
+      return withResolvedInvocationTarget({
+        result: {
+          resolvedHeaders: responseHeaders,
+          status,
+        },
+        url: filesystemUrl,
+        resolvedPathname,
+        invocationPathname: filesystemUrl.pathname,
+      })
+    }
+
     const dynamicCheck = checkDynamicRoutes(
       routes.dynamicRoutes,
       requestUrl,
@@ -1195,6 +1999,8 @@ export async function resolveRoutes({
       requestHeaders,
       resolvedHeaders,
       routes.onMatch,
+      trailingSlash,
+      caseSensitive,
       basePath,
       buildId,
       shouldNormalizeNextData,
@@ -1212,46 +2018,47 @@ export async function resolveRoutes({
       }
     }
 
-    let filesystemUrl = requestUrl
+    const rewrittenDynamicPathnameCheck = checkDynamicPathnameMatches(
+      pathnames,
+      requestUrl,
+      requestHeaders,
+      resolvedHeaders,
+      routes.onMatch,
+      trailingSlash,
+      caseSensitive,
+      dynamicPrerenderRoutes
+    )
 
-    if (isNextDataRequest && shouldNormalizeNextData) {
-      filesystemUrl = denormalizeNextDataUrl(requestUrl, basePath, buildId)
-    }
-
-    resolvedPathname = matchesPathname(filesystemUrl.pathname, pathnames)
-
-    if (resolvedPathname) {
-      const responseHeaders = applyOnMatchHeaders(
-        routes.onMatch,
-        filesystemUrl,
-        requestHeaders,
-        resolvedHeaders
-      )
-
-      return withResolvedInvocationTarget({
-        result: {
-          resolvedHeaders: responseHeaders,
-          status,
-        },
-        url: filesystemUrl,
-        resolvedPathname,
-        invocationPathname: filesystemUrl.pathname,
-      })
+    if (rewrittenDynamicPathnameCheck.matched && rewrittenDynamicPathnameCheck.result) {
+      return {
+        ...rewrittenDynamicPathnameCheck.result,
+        status,
+      }
     }
   }
 
   return {
     resolvedHeaders,
+    resolvedRequestUrl: requestUrl,
     status,
   }
+}
+
+function isLoopbackHostname(hostname) {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]'
 }
 
 function getRelativeURL(value, base) {
   try {
     const resolved = new URL(value, base)
     const baseUrl = new URL(base)
+    const sameLoopbackOrigin =
+      resolved.protocol === baseUrl.protocol &&
+      resolved.port === baseUrl.port &&
+      isLoopbackHostname(resolved.hostname) &&
+      isLoopbackHostname(baseUrl.hostname)
 
-    if (resolved.origin === baseUrl.origin) {
+    if (resolved.origin === baseUrl.origin || sameLoopbackOrigin) {
       return `${resolved.pathname}${resolved.search}${resolved.hash}`
     }
 
@@ -1259,6 +2066,10 @@ function getRelativeURL(value, base) {
   } catch {
     return value
   }
+}
+
+function isRscRequest(url, headers) {
+  return headers.get('rsc') === '1'
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
@@ -1329,7 +2140,8 @@ export function responseToMiddlewareResult(response, requestHeaders, requestUrl)
   if (
     !collectedHeaders['x-middleware-rewrite'] &&
     !collectedHeaders['x-middleware-next'] &&
-    !collectedHeaders.location
+    !collectedHeaders.location &&
+    !collectedHeaders['x-matched-path']
   ) {
     collectedHeaders['x-middleware-refresh'] = '1'
   }
@@ -1366,10 +2178,16 @@ export function responseToMiddlewareResult(response, requestHeaders, requestUrl)
         for (const item of value) {
           responseHeaders.append(key, item)
           requestHeaders.append(key, item)
+          if (key === 'set-cookie') {
+            requestHeaders.append('x-middleware-set-cookie', item)
+          }
         }
       } else {
         responseHeaders.set(key, value)
         requestHeaders.set(key, value)
+        if (key === 'set-cookie') {
+          requestHeaders.append('x-middleware-set-cookie', value)
+        }
       }
     }
   }
@@ -1388,6 +2206,16 @@ export function responseToMiddlewareResult(response, requestHeaders, requestUrl)
       if (rewriteUrl.origin !== requestUrl.origin) {
         result.rewrite = rewriteUrl
         return result
+      }
+
+      if (isRscRequest(requestUrl, requestHeaders)) {
+        if (requestUrl.pathname !== rewriteUrl.pathname) {
+          responseHeaders.set('x-nextjs-rewritten-path', rewriteUrl.pathname)
+        }
+
+        if (requestUrl.search !== rewriteUrl.search) {
+          responseHeaders.set('x-nextjs-rewritten-query', rewriteUrl.search.slice(1))
+        }
       }
 
       result.rewrite = rewriteUrl

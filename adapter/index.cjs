@@ -4,7 +4,6 @@ const vm = require('node:vm')
 
 const ROUTE_OUTPUT_GROUPS = ['pages', 'pagesApi', 'appPages', 'appRoutes']
 const NEXT_DIST_EXCLUDE_NAMES = new Set(['cache', 'diagnostics', 'trace', 'trace-build', 'types'])
-const NATIVE_BINARY_EXTENSIONS = new Set(['.node', '.dylib', '.so'])
 const DEFAULT_NODE_PORT = 8080
 
 function toPosixPath(filePath) {
@@ -26,7 +25,20 @@ async function pathExists(filePath) {
 }
 
 function hasExtension(pathname) {
-  return path.extname(pathname) !== ''
+  const basename = path.posix.basename(toPosixPath(pathname))
+  const lastDotIndex = basename.lastIndexOf('.')
+
+  if (lastDotIndex <= 0) {
+    return false
+  }
+
+  const lastClosingParenIndex = basename.lastIndexOf(')')
+
+  if (basename.startsWith('(') && lastClosingParenIndex >= 0 && lastDotIndex < lastClosingParenIndex) {
+    return false
+  }
+
+  return true
 }
 
 function toAssetRelativePath(pathname, filePath) {
@@ -276,6 +288,100 @@ async function collectRuntimePackageSpecifiers(runtimeFiles) {
   return packageSpecifiers
 }
 
+function parseNodeModulesPackagePath(relativePath) {
+  const normalizedPath = toPosixPath(relativePath)
+
+  if (!normalizedPath.startsWith('node_modules/')) {
+    return null
+  }
+
+  const packagePath = normalizedPath.slice('node_modules/'.length)
+  const segments = packagePath.split('/')
+
+  if (!segments[0]) {
+    return null
+  }
+
+  if (segments[0].startsWith('@')) {
+    if (segments.length < 2 || !segments[1]) {
+      return null
+    }
+
+    return {
+      packageSpecifier: `${segments[0]}/${segments[1]}`,
+      packageSubpath: segments.slice(2).join('/'),
+    }
+  }
+
+  return {
+    packageSpecifier: segments[0],
+    packageSubpath: segments.slice(1).join('/'),
+  }
+}
+
+function scoreNestedPackageCandidate(relativePath, packageSpecifier) {
+  const normalizedSpecifierPrefix = `${packageSpecifier.replace('/', '+')}@`
+  const normalizedPath = toPosixPath(relativePath)
+  const match = normalizedPath.match(/^node_modules\/\.pnpm\/([^/]+)\//)
+  const packageStoreName = match?.[1] ?? ''
+
+  return packageStoreName.startsWith(normalizedSpecifierPrefix) ? 2 : 1
+}
+
+function collectNestedPackageSourceDirs(runtimeFiles) {
+  const nestedPackageSourceDirs = new Map()
+
+  for (const [relativePath, sourcePath] of runtimeFiles) {
+    const normalizedPath = toPosixPath(relativePath)
+    const match = normalizedPath.match(
+      /^node_modules\/\.pnpm\/[^/]+\/node_modules\/((?:@[^/]+\/)?[^/]+)\/package\.json$/
+    )
+
+    if (!match) {
+      continue
+    }
+
+    const packageSpecifier = match[1]
+    const candidate = {
+      score: scoreNestedPackageCandidate(normalizedPath, packageSpecifier),
+      sourceDir: path.dirname(sourcePath),
+    }
+    const existing = nestedPackageSourceDirs.get(packageSpecifier)
+
+    if (!existing || candidate.score > existing.score) {
+      nestedPackageSourceDirs.set(packageSpecifier, candidate)
+    }
+  }
+
+  return nestedPackageSourceDirs
+}
+
+function resolveNestedPackageSourcePath(relativePath, nestedPackageSourceDirs) {
+  const parsedPackagePath = parseNodeModulesPackagePath(relativePath)
+
+  if (!parsedPackagePath) {
+    return null
+  }
+
+  const candidate = nestedPackageSourceDirs.get(parsedPackagePath.packageSpecifier)
+
+  if (!candidate?.sourceDir) {
+    return null
+  }
+
+  if (!parsedPackagePath.packageSubpath) {
+    return {
+      kind: 'directory',
+      sourcePath: candidate.sourceDir,
+    }
+  }
+
+  return {
+    kind: 'file',
+    sourcePath: path.join(candidate.sourceDir, parsedPackagePath.packageSubpath),
+  }
+}
+
 async function patchHashedPackageRequiresForWorkers(filePath, runtimePackageSpecifiers) {
   const originalSource = await fs.readFile(filePath, 'utf8')
 
@@ -287,19 +393,42 @@ async function patchHashedPackageRequiresForWorkers(filePath, runtimePackageSpec
     if (
       !specifier ||
       specifier.startsWith('.') ||
-      specifier.startsWith('/') ||
-      !/-[0-9a-f]{8,}$/.test(specifier)
+      specifier.startsWith('/')
     ) {
       return specifier
     }
 
-    const unhashedSpecifier = specifier.replace(/-[0-9a-f]{8,}$/, '')
-    return unhashedSpecifier
+    const segments = specifier.split('/')
+    const packageSegmentCount = specifier.startsWith('@') ? 2 : 1
+
+    if (segments.length < packageSegmentCount) {
+      return specifier
+    }
+
+    const packageSpecifier = segments.slice(0, packageSegmentCount).join('/')
+
+    if (!/-[0-9a-f]{8,}$/.test(packageSpecifier)) {
+      return specifier
+    }
+
+    const unhashedPackageSpecifier = packageSpecifier.replace(/-[0-9a-f]{8,}$/, '')
+
+    if (!runtimePackageSpecifiers.has(unhashedPackageSpecifier)) {
+      return specifier
+    }
+
+    const packageSubpath = segments.slice(packageSegmentCount).join('/')
+    return packageSubpath
+      ? `${unhashedPackageSpecifier}/${packageSubpath}`
+      : unhashedPackageSpecifier
   }
 
   let patchedSource = originalSource.replaceAll(
-    /(["'])([@a-zA-Z0-9_.\/-]+-[0-9a-f]{8,})\1/g,
-    (match, quote, specifier) => `${quote}${rewriteSpecifier(specifier)}${quote}`
+    /(["'])([^"'`\n]+)\1/g,
+    (match, quote, specifier) => {
+      const rewrittenSpecifier = rewriteSpecifier(specifier)
+      return rewrittenSpecifier === specifier ? match : `${quote}${rewrittenSpecifier}${quote}`
+    }
   )
 
   patchedSource = patchedSource.replaceAll(
@@ -397,6 +526,33 @@ async function patchLoadManifestForWorkers(filePath) {
   }
 }
 
+async function patchSqlite3BindingForWorkers(filePath) {
+  await fs.writeFile(
+    filePath,
+    [
+      "var fs = require('fs')",
+      "var path = require('path')",
+      "var bindingRoot = path.join(__dirname, 'binding')",
+      'var binding = null',
+      '',
+      'for (var entry of fs.readdirSync(bindingRoot)) {',
+      "  var candidate = path.join(bindingRoot, entry, 'node_sqlite3.node')",
+      '  if (fs.existsSync(candidate)) {',
+      '    binding = candidate',
+      '    break',
+      '  }',
+      '}',
+      '',
+      'if (!binding) {',
+      "  throw new Error('Could not find sqlite3 native binding in runtime repo')",
+      '}',
+      '',
+      'module.exports = exports = require(binding)',
+      '',
+    ].join('\n')
+  )
+}
+
 async function copyDirectory(sourceDir, destinationDir) {
   const entries = await fs.readdir(sourceDir, { withFileTypes: true })
 
@@ -405,6 +561,20 @@ async function copyDirectory(sourceDir, destinationDir) {
   for (const entry of entries) {
     const sourcePath = path.join(sourceDir, entry.name)
     const destinationPath = path.join(destinationDir, entry.name)
+
+    if (entry.isSymbolicLink()) {
+      const resolvedSourcePath = await fs.realpath(sourcePath)
+      const resolvedStats = await fs.stat(resolvedSourcePath)
+
+      if (resolvedStats.isDirectory()) {
+        await copyDirectory(resolvedSourcePath, destinationPath)
+        continue
+      }
+
+      await fs.mkdir(path.dirname(destinationPath), { recursive: true })
+      await fs.copyFile(resolvedSourcePath, destinationPath)
+      continue
+    }
 
     if (entry.isDirectory()) {
       await copyDirectory(sourcePath, destinationPath)
@@ -433,13 +603,84 @@ async function copyRuntimeImportFiles({ orderedRuntimeImports, projectDir, runti
   return copiedRuntimeImports
 }
 
+async function copyRuntimeSupportEntry(sourcePath, destinationPath) {
+  const sourceStats = await fs.lstat(sourcePath)
+
+  if (sourceStats.isSymbolicLink()) {
+    const resolvedSourcePath = await fs.realpath(sourcePath)
+    const resolvedStats = await fs.stat(resolvedSourcePath)
+
+    if (resolvedStats.isDirectory()) {
+      await copyDirectory(resolvedSourcePath, destinationPath)
+      return
+    }
+
+    await fs.mkdir(path.dirname(destinationPath), { recursive: true })
+    await fs.copyFile(resolvedSourcePath, destinationPath)
+    return
+  }
+
+  if (sourceStats.isDirectory()) {
+    await copyDirectory(sourcePath, destinationPath)
+    return
+  }
+
+  await fs.mkdir(path.dirname(destinationPath), { recursive: true })
+  await fs.copyFile(sourcePath, destinationPath)
+}
+
+function resolveNodeModulesPackageInfo(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath)
+  const segments = normalizedPath.split(path.sep)
+  const nodeModulesIndex = segments.lastIndexOf('node_modules')
+
+  if (nodeModulesIndex === -1 || nodeModulesIndex + 1 >= segments.length) {
+    return null
+  }
+
+  const firstSegment = segments[nodeModulesIndex + 1]
+
+  if (!firstSegment) {
+    return null
+  }
+
+  const packageSegments = firstSegment.startsWith('@')
+    ? segments.slice(nodeModulesIndex + 1, nodeModulesIndex + 3)
+    : [firstSegment]
+
+  if (packageSegments.length === 0 || packageSegments.some((segment) => !segment)) {
+    return null
+  }
+
+  return {
+    packageSpecifier: packageSegments.join('/'),
+    packageRoot: path.join(
+      path.isAbsolute(normalizedPath) ? path.sep : '',
+      ...segments.slice(0, nodeModulesIndex + 1 + packageSegments.length)
+    ),
+  }
+}
+
 async function copyRuntimeSupportFiles({ supportFiles, projectDir, runtimeRoot }) {
+  const copiedPackages = new Set()
+
   for (const sourcePath of supportFiles) {
     const relativePath = path.relative(projectDir, sourcePath)
     const destinationPath = path.join(runtimeRoot, relativePath)
 
-    await fs.mkdir(path.dirname(destinationPath), { recursive: true })
-    await fs.copyFile(sourcePath, destinationPath)
+    await copyRuntimeSupportEntry(sourcePath, destinationPath)
+
+    const packageInfo = resolveNodeModulesPackageInfo(sourcePath)
+
+    if (!packageInfo || copiedPackages.has(packageInfo.packageSpecifier)) {
+      continue
+    }
+
+    copiedPackages.add(packageInfo.packageSpecifier)
+    await copyRuntimeSupportEntry(
+      packageInfo.packageRoot,
+      path.join(runtimeRoot, 'node_modules', packageInfo.packageSpecifier)
+    )
   }
 }
 
@@ -571,6 +812,44 @@ function addRuntimeEnv(runtimeEnv, key, value) {
   runtimeEnv.set(key, value)
 }
 
+function shouldIncludeRuntimeProcessEnv(key, value) {
+  if (typeof value !== 'string') {
+    return false
+  }
+
+  if (!/^[A-Z0-9_]+$/.test(key)) {
+    return false
+  }
+
+  if (
+    key.startsWith('npm_') ||
+    key.startsWith('PNPM_') ||
+    key.startsWith('BASH_FUNC_')
+  ) {
+    return false
+  }
+
+  return !new Set([
+    '_',
+    'HOME',
+    'HOST',
+    'HOSTNAME',
+    'IFS',
+    'LOGNAME',
+    'NODE_ENV',
+    'NEXT_PHASE',
+    'OLDPWD',
+    'PATH',
+    'PWD',
+    'SHELL',
+    'SHLVL',
+    'TERM',
+    'TMPDIR',
+    'USER',
+    'ZDOTDIR',
+  ]).has(key)
+}
+
 function collectRuntimeEnv({ outputs, edgeRouteOutputs, config }) {
   const runtimeEnv = new Map()
   const envOutputs = [
@@ -613,6 +892,18 @@ function collectRuntimeEnv({ outputs, edgeRouteOutputs, config }) {
     }
   }
 
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!shouldIncludeRuntimeProcessEnv(key, value)) {
+      continue
+    }
+
+    if (runtimeEnv.has(key) && runtimeEnv.get(key) !== value) {
+      continue
+    }
+
+    addRuntimeEnv(runtimeEnv, key, value)
+  }
+
   return Object.fromEntries(runtimeEnv)
 }
 
@@ -633,11 +924,56 @@ function normalizeOutputPathname(pathname) {
 }
 
 function serializeRouteOutput(output) {
+  const config = output.config ? JSON.parse(JSON.stringify(output.config)) : undefined
+  const shouldPreserveIndexSegment =
+    output.type === 'APP_PAGE' || output.type === 'APP_ROUTE'
+
   return {
     type: output.type,
-    pathname: normalizeOutputPathname(output.pathname),
+    pathname: shouldPreserveIndexSegment
+      ? output.pathname
+      : normalizeOutputPathname(output.pathname),
+    ...(typeof output.sourcePage === 'string' ? { sourcePage: output.sourcePage } : {}),
     runtime: output.runtime,
     edgeRuntime: output.edgeRuntime,
+    config,
+  }
+}
+
+function getImageOptimizerPathname(nextConfig) {
+  const imagePath = nextConfig?.images?.path
+
+  if (typeof imagePath !== 'string' || !imagePath.startsWith('/')) {
+    return null
+  }
+
+  return normalizeOutputPathname(imagePath)
+}
+
+function createSyntheticImageOptimizerOutput(nextConfig, existingOutputs = []) {
+  if (nextConfig?.images?.unoptimized) {
+    return null
+  }
+
+  const pathname = getImageOptimizerPathname(nextConfig)
+
+  if (!pathname) {
+    return null
+  }
+
+  const alreadyExists = existingOutputs.some(
+    (output) => normalizeOutputPathname(output?.pathname) === pathname
+  )
+
+  if (alreadyExists) {
+    return null
+  }
+
+  return {
+    type: 'INTERNAL_ROUTE',
+    pathname,
+    runtime: 'nodejs',
+    config: {},
   }
 }
 
@@ -666,29 +1002,32 @@ async function resolvePrerenderDataFilePath(distDir, dataRoutePathname) {
   return null
 }
 
-async function resolvePrerenderDataRoutes({ outputs, distDir }) {
+async function readPrerenderManifest(distDir) {
   const prerenderManifestPath = path.join(distDir, 'prerender-manifest.json')
 
   if (!(await pathExists(prerenderManifestPath))) {
+    return null
+  }
+
+  return JSON.parse(await fs.readFile(prerenderManifestPath, 'utf8'))
+}
+
+async function resolvePrerenderDataRoutes({ distDir, prerenderManifest = null }) {
+  prerenderManifest = prerenderManifest ?? (await readPrerenderManifest(distDir))
+
+  if (!prerenderManifest) {
     return []
   }
 
-  const prerenderManifest = JSON.parse(await fs.readFile(prerenderManifestPath, 'utf8'))
   const prerenderDataRoutes = []
 
-  for (const prerender of outputs.prerenders ?? []) {
-    if (!prerender.fallback?.filePath || prerender.fallback.initialRevalidate !== false) {
+  for (const [pathname, route] of Object.entries(prerenderManifest.routes ?? {})) {
+    if (!route?.dataRoute) {
       continue
     }
 
-    const pathname = normalizeOutputPathname(prerender.pathname)
-    const dataRoutePathname = prerenderManifest.routes?.[pathname]?.dataRoute
-
-    if (!dataRoutePathname) {
-      continue
-    }
-
-    const normalizedDataRoutePathname = normalizeOutputPathname(dataRoutePathname)
+    const normalizedPathname = normalizeOutputPathname(pathname)
+    const normalizedDataRoutePathname = normalizeOutputPathname(route.dataRoute)
     const filePath = await resolvePrerenderDataFilePath(distDir, normalizedDataRoutePathname)
 
     if (!filePath) {
@@ -696,13 +1035,67 @@ async function resolvePrerenderDataRoutes({ outputs, distDir }) {
     }
 
     prerenderDataRoutes.push({
-      pathname,
+      pathname: normalizedPathname,
       dataRoutePathname: normalizedDataRoutePathname,
       filePath,
     })
   }
 
   return prerenderDataRoutes
+}
+
+async function resolveDynamicPrerenderRoutes({ distDir, prerenderManifest = null }) {
+  prerenderManifest = prerenderManifest ?? (await readPrerenderManifest(distDir))
+
+  if (!prerenderManifest) {
+    return {}
+  }
+
+  const pathnamesBySourceRoute = new Map()
+  const dataRoutePathnamesBySourceRoute = new Map()
+
+  for (const [pathname, route] of Object.entries(prerenderManifest.routes ?? {})) {
+    if (typeof route?.srcRoute !== 'string') {
+      continue
+    }
+
+    const normalizedSourceRoute = normalizeOutputPathname(route.srcRoute)
+    const normalizedPathname = normalizeOutputPathname(pathname)
+    const currentPathnames = pathnamesBySourceRoute.get(normalizedSourceRoute) ?? []
+
+    currentPathnames.push(normalizedPathname)
+    pathnamesBySourceRoute.set(normalizedSourceRoute, currentPathnames)
+
+    if (typeof route.dataRoute === 'string') {
+      const currentDataRoutePathnames = dataRoutePathnamesBySourceRoute.get(normalizedSourceRoute) ?? []
+
+      currentDataRoutePathnames.push(normalizeOutputPathname(route.dataRoute))
+      dataRoutePathnamesBySourceRoute.set(normalizedSourceRoute, currentDataRoutePathnames)
+    }
+  }
+
+  const dynamicPrerenderRoutes = {}
+
+  for (const [pathname, route] of Object.entries(prerenderManifest.dynamicRoutes ?? {})) {
+    if (route?.fallback !== false) {
+      continue
+    }
+
+    const normalizedPathname = normalizeOutputPathname(pathname)
+    const routeConfig = {
+      fallback: false,
+      pathnames: pathnamesBySourceRoute.get(normalizedPathname) ?? [],
+      dataRoutePathnames: dataRoutePathnamesBySourceRoute.get(normalizedPathname) ?? [],
+    }
+
+    dynamicPrerenderRoutes[normalizedPathname] = routeConfig
+
+    if (typeof route.dataRoute === 'string') {
+      dynamicPrerenderRoutes[normalizeOutputPathname(route.dataRoute)] = routeConfig
+    }
+  }
+
+  return dynamicPrerenderRoutes
 }
 
 function toOutputImportPath({ generatedDir, runtimeRepoRoot, repoRoot, filePath }) {
@@ -719,10 +1112,6 @@ function toRuntimeRequirePath({ generatedDir, runtimeRepoRoot, repoRoot, filePat
     repoRoot,
     filePath,
   })
-}
-
-function isNativeBinary(filePath) {
-  return NATIVE_BINARY_EXTENSIONS.has(path.extname(filePath)) || filePath.includes('sharp-libvips')
 }
 
 function addRuntimeFile(runtimeFiles, relativePath, sourcePath) {
@@ -780,6 +1169,27 @@ async function collectDirectoryFiles(runtimeFiles, sourceDir, repoRoot) {
       continue
     }
 
+    if (entry.isSymbolicLink()) {
+      let resolvedStats
+
+      try {
+        resolvedStats = await fs.stat(sourcePath)
+      } catch {
+        continue
+      }
+
+      if (resolvedStats.isDirectory()) {
+        await collectDirectoryFiles(runtimeFiles, sourcePath, repoRoot)
+        continue
+      }
+
+      if (resolvedStats.isFile()) {
+        addRepoRelativeRuntimeFile(runtimeFiles, repoRoot, sourcePath)
+      }
+
+      continue
+    }
+
     if (!entry.isFile()) {
       continue
     }
@@ -798,11 +1208,34 @@ async function collectLocalNodeModules(runtimeFiles, projectDir, repoRoot) {
   const entries = await fs.readdir(nodeModulesDir, { withFileTypes: true })
 
   for (const entry of entries) {
+    const sourcePath = path.join(nodeModulesDir, entry.name)
+
+    if (entry.isSymbolicLink()) {
+      let resolvedStats
+
+      try {
+        resolvedStats = await fs.stat(sourcePath)
+      } catch {
+        continue
+      }
+
+      if (resolvedStats.isDirectory()) {
+        await collectDirectoryFiles(runtimeFiles, sourcePath, repoRoot)
+        continue
+      }
+
+      if (resolvedStats.isFile()) {
+        addRepoRelativeRuntimeFile(runtimeFiles, repoRoot, sourcePath)
+      }
+
+      continue
+    }
+
     if (!entry.isDirectory()) {
       continue
     }
 
-    await collectDirectoryFiles(runtimeFiles, path.join(nodeModulesDir, entry.name), repoRoot)
+    await collectDirectoryFiles(runtimeFiles, sourcePath, repoRoot)
   }
 }
 
@@ -934,6 +1367,11 @@ async function collectNodeRuntimeFiles({ outputs, distDir, projectDir, repoRoot 
     path.join(projectDir, 'node_modules', 'next', 'dist', 'compiled', 'next-server'),
     repoRoot
   )
+  await collectDirectoryFiles(
+    runtimeFiles,
+    path.join(projectDir, 'node_modules', 'next', 'dist', 'trace'),
+    repoRoot
+  )
 
   return runtimeFiles
 }
@@ -941,30 +1379,40 @@ async function collectNodeRuntimeFiles({ outputs, distDir, projectDir, repoRoot 
 async function copyNodeRuntimeFiles({ runtimeFiles, runtimeRepoRoot }) {
   const nextPackageRootRelative = findNextPackageRootRelative(runtimeFiles)
   const runtimePackageSpecifiers = await collectRuntimePackageSpecifiers(runtimeFiles)
+  const nestedPackageSourceDirs = collectNestedPackageSourceDirs(runtimeFiles)
 
   for (const [relativePath, sourcePath] of runtimeFiles) {
-    if (isNativeBinary(sourcePath)) {
-      continue
-    }
-
+    let resolvedSourcePath = sourcePath
     let stats
-
-    try {
-      stats = await fs.lstat(sourcePath)
-    } catch {
-      const aliasSpecifier = resolveHashedPackageAlias(relativePath, runtimePackageSpecifiers)
-
-      if (aliasSpecifier) {
-        await writeRuntimePackageAlias(runtimeRepoRoot, relativePath, aliasSpecifier)
-      }
-
-      continue
-    }
-
     const destinationPath = path.join(runtimeRepoRoot, relativePath)
 
+    try {
+      stats = await fs.lstat(resolvedSourcePath)
+    } catch {
+      const nestedPackageSource = resolveNestedPackageSourcePath(relativePath, nestedPackageSourceDirs)
+
+      if (nestedPackageSource?.kind === 'directory') {
+        await fs.rm(destinationPath, { force: true, recursive: true }).catch(() => {})
+        await copyDirectory(nestedPackageSource.sourcePath, destinationPath)
+        continue
+      }
+
+      if (nestedPackageSource?.kind === 'file' && (await pathExists(nestedPackageSource.sourcePath))) {
+        resolvedSourcePath = nestedPackageSource.sourcePath
+        stats = await fs.lstat(resolvedSourcePath)
+      } else {
+        const aliasSpecifier = resolveHashedPackageAlias(relativePath, runtimePackageSpecifiers)
+
+        if (aliasSpecifier) {
+          await writeRuntimePackageAlias(runtimeRepoRoot, relativePath, aliasSpecifier)
+        }
+
+        continue
+      }
+    }
+
     if (stats.isSymbolicLink()) {
-      await copyRuntimeSymlink(sourcePath, destinationPath)
+      await copyRuntimeSymlink(resolvedSourcePath, destinationPath)
       continue
     }
 
@@ -972,7 +1420,7 @@ async function copyNodeRuntimeFiles({ runtimeFiles, runtimeRepoRoot }) {
       continue
     }
 
-    await copyRuntimeFile(sourcePath, destinationPath)
+    await copyRuntimeFile(resolvedSourcePath, destinationPath)
 
     if (destinationPath.endsWith('.js')) {
       await patchBareNextRequiresForWorkers(destinationPath, relativePath, nextPackageRootRelative)
@@ -991,6 +1439,10 @@ async function copyNodeRuntimeFiles({ runtimeFiles, runtimeRepoRoot }) {
 
       if (relativePath.endsWith('next/dist/server/load-manifest.external.js')) {
         await patchLoadManifestForWorkers(destinationPath)
+      }
+
+      if (relativePath.endsWith('sqlite3/lib/sqlite3-binding.js')) {
+        await patchSqlite3BindingForWorkers(destinationPath)
       }
     }
 
@@ -1018,12 +1470,36 @@ async function copyLocalProjectNodeModules({ projectDir, runtimeRepoRoot }) {
   const entries = await fs.readdir(projectNodeModulesDir, { withFileTypes: true })
 
   for (const entry of entries) {
-    if (entry.name === '.pnpm' || entry.isSymbolicLink()) {
+    if (entry.name === '.pnpm') {
       continue
     }
 
     const sourcePath = path.join(projectNodeModulesDir, entry.name)
     const destinationPath = path.join(runtimeNodeModulesDir, entry.name)
+
+    if (entry.isSymbolicLink()) {
+      let resolvedStats
+
+      try {
+        resolvedStats = await fs.stat(sourcePath)
+      } catch {
+        continue
+      }
+
+      await fs.rm(destinationPath, { force: true, recursive: true }).catch(() => {})
+
+      if (resolvedStats.isDirectory()) {
+        await copyDirectory(sourcePath, destinationPath)
+        continue
+      }
+
+      if (resolvedStats.isFile()) {
+        await fs.mkdir(path.dirname(destinationPath), { recursive: true })
+        await fs.copyFile(await fs.realpath(sourcePath), destinationPath)
+      }
+
+      continue
+    }
 
     if (entry.isDirectory()) {
       await fs.rm(destinationPath, { force: true, recursive: true }).catch(() => {})
@@ -1036,6 +1512,12 @@ async function copyLocalProjectNodeModules({ projectDir, runtimeRepoRoot }) {
       await fs.copyFile(sourcePath, destinationPath)
     }
   }
+
+  const pnpmLinkedNodeModulesDir = path.join(projectNodeModulesDir, '.pnpm', 'node_modules')
+
+  if (await pathExists(pnpmLinkedNodeModulesDir)) {
+    await copyDirectory(pnpmLinkedNodeModulesDir, runtimeNodeModulesDir)
+  }
 }
 
 async function patchNodeRuntimeTree({
@@ -1044,6 +1526,10 @@ async function patchNodeRuntimeTree({
   nextPackageRootRelative,
   runtimePackageSpecifiers,
 }) {
+  if (!(await pathExists(rootDir))) {
+    return
+  }
+
   const entries = await fs.readdir(rootDir, { withFileTypes: true })
 
   for (const entry of entries) {
@@ -1081,6 +1567,10 @@ async function patchNodeRuntimeTree({
 
     if (relativePath.endsWith('next/dist/server/load-manifest.external.js')) {
       await patchLoadManifestForWorkers(destinationPath)
+    }
+
+    if (relativePath.endsWith('sqlite3/lib/sqlite3-binding.js')) {
+      await patchSqlite3BindingForWorkers(destinationPath)
     }
 
     if (path.basename(destinationPath) === '[turbopack]_runtime.js') {
@@ -1207,6 +1697,85 @@ async function buildNodeRawEntries({
   return rawEntries
 }
 
+async function buildWorkerRawEntries({ distDir }) {
+  const rawEntries = []
+  const seenFilePaths = new Set()
+  const middlewareManifest = await readJsonIfExists(path.join(distDir, 'server', 'middleware-manifest.json'))
+
+  if (!middlewareManifest) {
+    return rawEntries
+  }
+
+  const manifestEntries = [
+    ...Object.values(middlewareManifest.middleware ?? {}),
+    ...Object.values(middlewareManifest.functions ?? {}),
+  ]
+
+  for (const entry of manifestEntries) {
+    for (const asset of entry?.assets ?? []) {
+      const filePath = toPosixPath(asset?.filePath || '')
+
+      if (!filePath || seenFilePaths.has(filePath)) {
+        continue
+      }
+
+      const sourcePath = path.join(distDir, filePath)
+
+      if (!(await pathExists(sourcePath))) {
+        continue
+      }
+
+      seenFilePaths.add(filePath)
+      rawEntries.push({
+        filePath: `blob:${filePath}`,
+        value: await fs.readFile(sourcePath, 'base64'),
+      })
+    }
+  }
+
+  return rawEntries
+}
+
+async function buildWorkerWasmEntries({ distDir }) {
+  const middlewareManifest = await readJsonIfExists(path.join(distDir, 'server', 'middleware-manifest.json'))
+
+  if (!middlewareManifest) {
+    return []
+  }
+
+  const wasmEntries = []
+  const seenNames = new Set()
+  const manifestEntries = [
+    ...Object.values(middlewareManifest.middleware ?? {}),
+    ...Object.values(middlewareManifest.functions ?? {}),
+  ]
+
+  for (const entry of manifestEntries) {
+    for (const wasmAsset of entry?.wasm ?? []) {
+      const name = typeof wasmAsset?.name === 'string' ? wasmAsset.name : ''
+      const filePath = toPosixPath(wasmAsset?.filePath || '')
+
+      if (!name || !filePath || seenNames.has(name)) {
+        continue
+      }
+
+      const sourcePath = path.join(distDir, filePath)
+
+      if (!(await pathExists(sourcePath))) {
+        continue
+      }
+
+      seenNames.add(name)
+      wasmEntries.push({
+        name,
+        filePath,
+      })
+    }
+  }
+
+  return wasmEntries
+}
+
 async function buildNodeEvalManifestEntries({
   runtimeFiles,
   projectDirRelative,
@@ -1306,6 +1875,7 @@ function buildWorkerManifest({
   assetMetadata,
   config,
   nextConfig,
+  dynamicPrerenderRoutes,
   outputs,
   prerenderDataRoutes = [],
   routing,
@@ -1314,10 +1884,7 @@ function buildWorkerManifest({
   nodeRuntime,
 }) {
   const routeOutputs = [...edgeRouteOutputs, ...nodeRouteOutputs].map(serializeRouteOutput)
-  const middleware =
-    outputs.middleware && outputs.middleware.runtime === 'edge'
-      ? serializeRouteOutput(outputs.middleware)
-      : null
+  const middleware = outputs.middleware ? serializeRouteOutput(outputs.middleware) : null
 
   const assetPathnames = [
     ...(outputs.staticFiles ?? []).map((output) => normalizeOutputPathname(output.pathname)),
@@ -1355,10 +1922,19 @@ function buildWorkerManifest({
     ...routeOutputs.map((output) => output.pathname),
     ...assetPathnames,
   ]
+  const manifestBasePath = config.basePath || ''
+  const notFoundPathname =
+    routeOutputs.find((output) => output.pathname === `${manifestBasePath}/_not-found`)?.pathname ||
+    routeOutputs.find((output) => output.pathname === `${manifestBasePath}/404`)?.pathname ||
+    routeOutputs.find((output) => output.pathname === `${manifestBasePath}/_error`)?.pathname ||
+    routeOutputs.find((output) => output.pathname === '/_not-found')?.pathname ||
+    routeOutputs.find((output) => output.pathname === '/404')?.pathname ||
+    routeOutputs.find((output) => output.pathname === '/_error')?.pathname ||
+    null
 
   return {
     buildId,
-    basePath: config.basePath || '',
+    basePath: manifestBasePath,
     i18n: config.i18n,
     nextConfig,
     routing,
@@ -1370,7 +1946,8 @@ function buildWorkerManifest({
     assetPathMap,
     assetMetadata,
     pathnames,
-    notFoundPathname: routeOutputs.find((output) => output.pathname === '/_not-found')?.pathname || null,
+    dynamicPrerenderRoutes,
+    notFoundPathname,
     nodeRuntime,
   }
 }
@@ -1395,11 +1972,19 @@ async function buildAssetMetadata(outputs, prerenderDataRoutes = []) {
   ]
 
   for (const assetOutput of assetOutputs) {
-    if (!assetOutput.filePath.endsWith('.body')) {
-      continue
+    let metadataPath = null
+
+    if (assetOutput.filePath.endsWith('.body')) {
+      metadataPath = assetOutput.filePath.slice(0, -'.body'.length) + '.meta'
+    } else if (assetOutput.filePath.endsWith('.rsc')) {
+      metadataPath = `${assetOutput.filePath.slice(0, -'.rsc'.length)}.meta`
+    } else if (assetOutput.filePath.endsWith('.html')) {
+      metadataPath = `${assetOutput.filePath.slice(0, -'.html'.length)}.meta`
     }
 
-    const metadataPath = assetOutput.filePath.slice(0, -'.body'.length) + '.meta'
+    if (!metadataPath) {
+      continue
+    }
 
     if (!(await pathExists(metadataPath))) {
       continue
@@ -1414,12 +1999,17 @@ async function buildAssetMetadata(outputs, prerenderDataRoutes = []) {
 
 async function writeGeneratedFiles({
   outputDir,
+  runtimeRepoRoot,
+  nextServerEntryRelative = null,
   runtimeEnv,
   copiedRuntimeImports,
   workerManifest,
   nodeRouteOutputImports,
   nodeChunkRequireEntries = [],
   nodeRawEntries = [],
+  workerRawEntries = [],
+  workerWasmEntries = [],
+  workerDistDir = '.next',
   nodeJsonEntries = [],
   nodeEvalManifestEntries = [],
 }) {
@@ -1430,6 +2020,8 @@ async function writeGeneratedFiles({
   const nodeBootstrapPath = path.join(generatedDir, 'node-bootstrap.mjs')
   const chunkRequirePath = path.join(generatedDir, 'chunk-requires.cjs')
   const rawFilePath = path.join(generatedDir, 'raw-files.cjs')
+  const workerRawFilePath = path.join(generatedDir, 'worker-raw-files.mjs')
+  const workerWasmModulePath = path.join(generatedDir, 'worker-wasm-modules.mjs')
   const jsonFilePath = path.join(generatedDir, 'json-files.cjs')
   const evalManifestPath = path.join(generatedDir, 'eval-manifests.cjs')
   const manifestPath = path.join(generatedDir, 'manifest.mjs')
@@ -1468,6 +2060,54 @@ async function writeGeneratedFiles({
       ({ filePath, value }) =>
         `globalThis._NODE_RAW_FILES[${JSON.stringify(filePath)}] = ${JSON.stringify(value)}`
     ),
+    '',
+  ].join('\n')
+
+  const workerRawFileSource = [
+    `globalThis._WORKER_RAW_FILES ??= {}`,
+    ...workerRawEntries.map(
+      ({ filePath, value }) =>
+        `globalThis._WORKER_RAW_FILES[${JSON.stringify(filePath)}] = ${JSON.stringify(value)}`
+    ),
+    '',
+  ].join('\n')
+
+  const workerWasmModuleImports = workerWasmEntries.map(({ filePath }, index) => {
+    const importPath = path.posix.join(
+      '..',
+      'runtime',
+      toPosixPath(workerDistDir),
+      toPosixPath(filePath)
+    )
+
+    return `import wasmModule${index} from ${JSON.stringify(importPath)}`
+  })
+  const workerWasmModuleMap = workerWasmEntries
+    .map(
+      ({ name }, index) =>
+        `  ${JSON.stringify(typeof name === 'string' ? name : '')}: wasmModule${index},`
+    )
+    .join('\n')
+  const workerWasmModuleSource = [
+    ...workerWasmModuleImports,
+    ``,
+    `const wasmModules = {`,
+    workerWasmModuleMap,
+    `}`,
+    ``,
+    `for (const [name, module] of Object.entries(wasmModules)) {`,
+    `  if (!name || !module || name in globalThis) {`,
+    `    continue`,
+    `  }`,
+    ``,
+    `  Object.defineProperty(globalThis, name, {`,
+    `    configurable: true,`,
+    `    enumerable: false,`,
+    `    get() {`,
+    `      return module`,
+    `    },`,
+    `  })`,
+    `}`,
     '',
   ].join('\n')
 
@@ -1518,9 +2158,11 @@ async function writeGeneratedFiles({
   const manifestSource = `export const manifest = ${JSON.stringify(workerManifest, null, 2)}\n`
 
   const workerEntrySource = [
+    `import { createWorker } from './runtime-support/worker-runtime.mjs'`,
+    `import './generated/worker-raw-files.mjs'`,
+    `import './generated/worker-wasm-modules.mjs'`,
     `import './generated/chunks.mjs'`,
     `import { manifest } from './generated/manifest.mjs'`,
-    `import { createWorker } from './runtime-support/worker-runtime.mjs'`,
     ``,
     `export default createWorker(manifest)`,
     '',
@@ -1529,6 +2171,8 @@ async function writeGeneratedFiles({
   await Promise.all([
     fs.writeFile(runtimeEnvPath, runtimeEnvSource),
     fs.writeFile(rawFilePath, rawFileSource),
+    fs.writeFile(workerRawFilePath, workerRawFileSource),
+    fs.writeFile(workerWasmModulePath, workerWasmModuleSource),
     fs.writeFile(jsonFilePath, jsonFileSource),
     fs.writeFile(evalManifestPath, evalManifestSource),
     fs.writeFile(chunkRequirePath, chunkRequireSource),
@@ -1544,6 +2188,8 @@ async function writeGeneratedFiles({
           copiedRuntimeImports,
           manifest: workerManifest,
           embeddedRawFiles: nodeRawEntries.map(({ filePath }) => filePath),
+          embeddedWorkerRawFiles: workerRawEntries.map(({ filePath }) => filePath),
+          embeddedWorkerWasmModules: workerWasmEntries.map(({ name, filePath }) => ({ name, filePath })),
           embeddedJsonFiles: nodeJsonEntries.map(({ filePath }) => filePath),
           embeddedEvalManifests: nodeEvalManifestEntries.map(({ filePath }) => filePath),
         },
@@ -1580,7 +2226,9 @@ const adapter = {
 
     await fs.rm(outputDir, { recursive: true, force: true })
     await fs.mkdir(assetRoot, { recursive: true })
-    const prerenderDataRoutes = await resolvePrerenderDataRoutes({ outputs, distDir })
+    const prerenderManifest = await readPrerenderManifest(distDir)
+    const prerenderDataRoutes = await resolvePrerenderDataRoutes({ distDir, prerenderManifest })
+    const dynamicPrerenderRoutes = await resolveDynamicPrerenderRoutes({ distDir, prerenderManifest })
 
     for (const staticFile of outputs.staticFiles ?? []) {
       await copyAssetFile(staticFile.filePath, assetRoot, staticFile.pathname)
@@ -1596,6 +2244,12 @@ const adapter = {
 
     for (const prerenderDataRoute of prerenderDataRoutes) {
       await copyAssetFile(prerenderDataRoute.filePath, assetRoot, prerenderDataRoute.dataRoutePathname)
+    }
+
+    const publicDir = path.join(projectDir, 'public')
+
+    if (await pathExists(publicDir)) {
+      await copyDirectory(publicDir, assetRoot)
     }
 
     const orderedRuntimeImports = collectOrderedRuntimeImports({
@@ -1617,6 +2271,12 @@ const adapter = {
       projectDir,
       runtimeRoot,
     })
+    await patchNodeRuntimeTree({
+      rootDir: runtimeRoot,
+      baseDir: runtimeRoot,
+      nextPackageRootRelative: 'node_modules/next',
+      runtimePackageSpecifiers: new Set(),
+    })
     const requiredServerFilesManifest = hasNodeRuntime
       ? await readJsonIfExists(path.join(distDir, 'required-server-files.json'))
       : null
@@ -1625,6 +2285,8 @@ const adapter = {
     let nodeRouteOutputImports = []
     let nodeChunkRequireEntries = []
     let nodeRawEntries = []
+    let workerRawEntries = []
+    let workerWasmEntries = []
     let nodeJsonEntries = []
     let nodeEvalManifestEntries = []
 
@@ -1643,6 +2305,12 @@ const adapter = {
       await copyLocalProjectNodeModules({
         projectDir,
         runtimeRepoRoot,
+      })
+      await patchNodeRuntimeTree({
+        rootDir: runtimeRepoRoot,
+        baseDir: runtimeRepoRoot,
+        nextPackageRootRelative: 'node_modules/next',
+        runtimePackageSpecifiers: new Set(),
       })
 
       nextServerEntryRelative = findNextServerEntryRelative(runtimeFiles)
@@ -1687,17 +2355,38 @@ const adapter = {
       })
     }
 
+    const syntheticNodeOutputs = []
+    const syntheticImageOptimizerOutput =
+      hasNodeRuntime
+        ? createSyntheticImageOptimizerOutput(serializedConfig, [
+            ...(edgeRouteOutputs ?? []),
+            ...(nodeRouteOutputs ?? []),
+          ])
+        : null
+
+    if (syntheticImageOptimizerOutput) {
+      syntheticNodeOutputs.push(syntheticImageOptimizerOutput)
+    }
+
+    const allNodeRouteOutputs = [...nodeRouteOutputs, ...syntheticNodeOutputs]
+
+    workerRawEntries = await buildWorkerRawEntries({ distDir })
+    workerWasmEntries = await buildWorkerWasmEntries({
+      distDir,
+    })
+
     const assetMetadata = await buildAssetMetadata(outputs, prerenderDataRoutes)
     const workerManifest = buildWorkerManifest({
       buildId,
       assetMetadata,
       config,
       nextConfig: serializedConfig,
+      dynamicPrerenderRoutes,
       outputs,
       prerenderDataRoutes,
       routing,
       edgeRouteOutputs,
-      nodeRouteOutputs,
+      nodeRouteOutputs: allNodeRouteOutputs,
       nodeRuntime: hasNodeRuntime
         ? {
             enabled: true,
@@ -1715,12 +2404,17 @@ const adapter = {
 
     await writeGeneratedFiles({
       outputDir,
+      runtimeRepoRoot,
+      nextServerEntryRelative,
       runtimeEnv,
       copiedRuntimeImports,
       workerManifest,
       nodeRouteOutputImports,
       nodeChunkRequireEntries,
       nodeRawEntries,
+      workerRawEntries,
+      workerWasmEntries,
+      workerDistDir: config.distDir || '.next',
       nodeJsonEntries,
       nodeEvalManifestEntries,
     })
